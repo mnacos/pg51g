@@ -1,0 +1,89 @@
+<project name="JComparator" default="help" basedir=".">
+<!-- m.nacos@gmail.com -->
+	<description> Sample Java code for pg51g-based cross-db data comparison at the table level </description>
+
+<!-- IMPORTANT CONFIGURATION PROPERTIES -->
+
+        <!-- please set this to something reasonable to take advantage of multi-threading support -->
+	<property name="maxmemory" value="512m"/>
+
+        <!-- so that we don't have to re-write these every time -->
+        <condition property="con1.string" value="${str1}" else="jdbc:postgresql://localhost:5432/pg51gTests">
+			<isset property="str1"/></condition>
+        <condition property="con1.table" value="${tbl1}" else="pg51g.testdata_vanilla_table">
+			<isset property="tbl1"/></condition>
+        <condition property="con1.user" value="${usr1}" else="update51g">
+			<isset property="usr1"/></condition>
+        <condition property="con1.pass" value="${pwd1}" else="update51g">
+			<isset property="pwd1"/></condition>
+
+        <condition property="con2.string" value="${str2}" else="jdbc:postgresql://localhost:5432/pg51gTests">
+			<isset property="str2"/></condition>
+        <condition property="con2.table" value="${tbl2}" else="pg51g.saved_testdata_vanilla_table">
+			<isset property="tbl2"/></condition>
+        <condition property="con2.user" value="${usr2}" else="update51g">
+			<isset property="usr2"/></condition>
+        <condition property="con2.pass" value="${pwd2}" else="update51g">
+			<isset property="pwd2"/></condition>
+
+		<!-- note: the tables defined above need to correspond to sigtbls, not the original tables -->
+
+<!-- Please do not modify anything below this line -->
+
+	<path id="my-libs">
+		<fileset dir="lib">
+			<include name="*.jar"/>
+		</fileset>
+	</path>
+
+	<target name="help">
+		<echo message="USAGE: ----------------------------------------------------------------------JComparator--"/>
+		<echo message="ant             -> gives you this information"/>
+		<echo message="ant help        -> ditto"/>
+		<echo message="ant make        -> re-compiles and deploys all Java code in src/"/>
+		<echo message="ant run         -> THIS IS WHAT YOU WANT ->    *** starts cross-db table comparison ***"/>
+		<echo message="-----------------------------------------------------------------------m.nacos@gmail.com--"/>
+		<echo message="please adjust your connection strings in build.xml or supply all necessary arguments"/>
+		<echo message="  e.g. ant -Dtbl1 pg51g.testdata_vanilla_table -Dtbl2 pg51g.saved_testdata_vanilla_table  ..."/>
+	</target>
+
+	<target name="run">
+		<echo message="Starting the JComparator process..."/>
+		<java classname="JComparator" fork="true" failonerror="true" maxmemory="${maxmemory}">
+			<classpath>
+				<pathelement location="bin"/>
+				<path refid="my-libs"/>
+			</classpath>
+			<arg value="${con1.string}"/>
+			<arg value="${con1.user}"/>
+			<arg value="${con1.pass}"/>
+			<arg value="${con1.table}"/>
+			<arg value="${con2.string}"/>
+			<arg value="${con2.user}"/>
+			<arg value="${con2.pass}"/>
+			<arg value="${con2.table}"/>
+		</java>
+	</target>
+
+	<target name="make">
+		<echo message="Trying to compile the JComparator source file(s)..."/>
+                <!-- deleting all .class files was useful during development, disabling ... -->
+                <mkdir dir="bin"/>
+		<delete includeemptydirs="true">
+			<fileset dir="bin" includes="**/*"/>
+		</delete>
+                <!-- -->
+		<javac srcdir=".">
+			<classpath>
+				<path refid="my-libs"/>
+			</classpath>
+			<include name="**/*.java"/>
+		</javac>
+		<move todir="bin">
+			<fileset dir=".">
+				<include name="**/*.class"/>
+			</fileset>
+		</move>
+	</target>
+
+</project>

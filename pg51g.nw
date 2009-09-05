@@ -1,0 +1,3327 @@
+@ This is the [[pg51g]] project, which draws heavily from Fabien Coelho's work on
+  Remote Comparison of Database Tables (Technical Report A/375/CRI - Feb 6, 2006)
+
+  For more information, please see: http://cri.ensmp.fr/classement/doc/A-375.pdf
+
+@ Note: this file is meant to be processed with noweb, an simple, efficient literate
+  programming tool. This does not imply this has been proper literate programming.
+
+  For more information, please see: http://www.cs.tufts.edu/~nr/noweb
+
+  This is a C-based, clean re-implementation of the proposed comparison method from scratch.
+  No code is shared between this project and pg_comparator, the original Perl implementation.
+
+  Please read the LICENSE and the "Simple usage guide" before you do anything with this software
+
+@ Contents
+@ -----------------------------------------------------------------------------------------------
+
+   1. Introduction
+   2. Status
+   3. LICENSE
+   4. Simple usage guide
+   5. Compiling, testing, installing code and generating docs
+   6. noweb Target definitions
+   7. C code and associated SQL stubs
+   8. Implementation notes
+   9. SQL schema
+  10. PL/pgSQL Convenience Functions
+  11. PL/Perl Prototype Functions
+
+ 
+@ Section 1: Introduction
+@ -----------------------------------------------------------------------------------------------
+
+@ Abstract: The aim of this project is the generation of md5 signatures at various
+  folding levels for all or some tables in a schema/database. Ideally, a separate
+  special schema (pg51g) will exist and changes in the data will automatically
+  update the relevant data structures in the pg51g schema via triggers in a minimal
+  way. The signature tables may then be used for row-level data comparisons.
+
+@ The structure of the signature tables needs to be well defined and uniform across
+  databases, or even database systems. The current plan is: for each table that we
+  process there should be a table with a schema_table name in the pg51g schema. Each
+  such table needs to contain three fields (level, key, value). Key is the md5 checksum
+  of the target table's primary key, value is the md5 checksum of the text that results
+  from the concatenation of all fields for the relevant record. Levels (INT) are there
+  for "folding" purposes. In particular, level 0 corresponds to a key-val pair for each 
+  record in the target table. levels 1 and upwards correspond to aggregate checksums
+  (through XOR) obtained for groups of records.
+
+@ This is a departure from the Fabien's original approach of creating a separate table
+  for each folding level. If you have many original tables, this simplifies maintenance.
+
+@ Note to self: currently using suboptimal (level, pri, key, value)
+
+@ Because we are casting all field types to text and concatenating the resulting values
+  to obtain the md5 checksums for the value field of the signature table, our approach
+  may be sensitive to locale settings or different database systems. Further investigation
+  is needed to determine the extent of our sensitivity to such factors and our options for
+  minimizing such impact.
+
+@ Section 2: Status
+@ -----------------------------------------------------------------------------------------------
+
+  Current release (0.92) seems to work fine on Postgresql 8.3.x and 8.4 servers, at present.
+  This software is considered "beta". Use for your own amusement in non-critical systems.
+  Please read the LICENSE below. Use/Modification of this software implies its full acceptance.
+  Project website: http://pgdba.net/pg51g -- You may contact the author at m.nacos@gmail.com
+
+                                                                 -- Fri Sep  4 12:48:27 BST 2009
+@ Section 3: LICENSE
+@ -----------------------------------------------------------------------------------------------
+
+pg51g - a data diff tool for Postgresql databases
+
+Copyright (c) 2009, Michael Nacos
+
+Permission to use, copy, modify, and distribute this software and its
+documentation for any purpose, without fee, and without a written agreement
+is hereby granted, provided that the above copyright notice and this
+paragraph and the following two paragraphs appear in all copies.
+
+IN NO EVENT SHALL MICHAEL NACOS BE LIABLE TO ANY PARTY FOR
+DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING
+LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS
+DOCUMENTATION, EVEN IF THE UNIVERSITY OF CALIFORNIA HAS BEEN ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+MICHAEL NACOS SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS" BASIS,
+AND MICHAEL NACOS HAS NO OBLIGATIONS TO PROVIDE MAINTENANCE, SUPPORT, UPDATES,
+ENHANCEMENTS, OR MODIFICATIONS.
+
+@ Section 4: Simple usage guide
+@ -----------------------------------------------------------------------------------------------
+
+  Two basic comparison modes are currently supported:
+
+   - comparison between current state of data and a saved signatures snapshot in the same DB
+   - comparison between the current states of data in two remote DBs
+
+   there is nothing stopping you, however, from using any combination of current states and
+   saved snapshots if you are using an external tool, such as the simple java client provided
+
+   Here are a few simple use-cases:
+
+   Snap-Diff everything:
+   ---------------------
+   - There is already a target database (e.g. targetDB) on your system which you own
+   - assuming pg51g.so is already in Postgresql lib dir, you `cat pg51g.sql | cat | psql -U postgres targetDB`
+   - inside the database, you run SELECT * FROM pg51g_bulk_add(); -- this adds all the tables it can to the system
+   - you then run SELECT * FROM pg51g_bulk_snap(); -- this saves a snapshot of all signature tables
+   - now use your database as you normally would -- the right triggers have been already installed for you
+   - see all differences in all tables from saved state at any time by typing: SELECT * FROM pg51g_bulk_diff();
+
+   Note: the pg51g_bulk_add() operation may take approx. 1 hour for each million rows in your database
+
+   More use-cases will soon follow, please check the online docs at http://pgdba.net/pg51g
+
+   Note: you may supply/override key or val definitions, using the functions pg51g.key(...), pg51g.val(...)
+   A complete list of available functions may be derived through \df pg51g.* in psql
+
+   If you have tables with composite primary keys and you want decent trigger performance, it might be worth
+   adding extra BTREE indices to these tables for each of the attributes which participate in the primary key
+
+   The system also supports VIEWs and TEMP VIEWs: please make sure you pg51g.do(...) before you pg51g.diff(...)
+   [no convenience/bulk functions are provided -- these are trivial to implement, please see existing ones]
+
+@ Section 5: Compiling, testing, installing code and generating docs
+@ -----------------------------------------------------------------------------------------------
+
+@ Instructions:
+   - you may compile the C source code by typing: notangle pg51g.nw > pg51g.c ; make pg51g.so
+   - you may get all the necessary SQL by typing: notangle -Rallsql pg51g.nw > pg51g.sql
+   - you may easily print an html page of all this through: noweave -filter l2h -autodefs c -index -html pg51g.nw > pg51g.html
+   - installation: place pg51g.so or a symlink in the postgresql lib directory and throw pg51g.sql at db of choice
+   - there is a Perl script (test-pg51g.pl) which does automated testing of the pg51g system with random data
+   - there is also a very basic Java client for cross-database comparisons (edit build.xml and type 'ant run')
+
+if you produce an html version of this file, you may want to add some CSS style guidelines somewhere in this html page e.g.
+<style> pre { border-style: solid; border-width: 1px; } hr { border-style: dashed; border-width: 3px; color: red; } </style>
+
+@ Section 6: noweb Target definitions
+@ -----------------------------------------------------------------------------------------------
+
+<<*>>=
+/*
+** Filename: pg51g.c
+*/
+#include "postgres.h"
+#include "fmgr.h"
+#include "funcapi.h"
+#include "executor/spi.h"
+#include "nodes/execnodes.h"
+#include "commands/trigger.h"
+#include "utils/builtins.h"
+#include <ctype.h>
+
+#ifdef PG_MODULE_MAGIC
+PG_MODULE_MAGIC;
+#endif
+
+<<pg51g_internal_functions>>
+<<pg51g_xor_md5>>
+<<pg51g_is_md5>>
+<<pg51g_group_md5>>
+<<pg51g_on_change>>
+<<pg51g_dummy_trigger>>
+<<pg51g_freeze_trigger>>
+<<pg51g_add_table>>
+<<pg51g_rm_table>>
+<<pg51g_diff_table>>
+<<pg51g_do_table>>
+<<pg51g_snap_table>>
+<<pg51g_monitor_table>>
+<<pg51g_unmonitor_table>>
+<<pg51g_freeze_table>>
+<<pg51g_unfreeze_table>>
+<<pg51g_define_pkey>>
+<<pg51g_define_val>>
+<<pg51g_undef_pkey>>
+<<pg51g_undef_val>>
+
+@ This is just a convenience entry for generating a single file with all SQL commands necessary
+
+<<allsql>>=
+
+-- This is all the SQL you need for pg51g
+
+<<pg51g_create_schema>>
+<<sql:pg51g_is_md5>>
+<<sql:pg51g_xor_md5>>
+<<sql:pg51g_group_md5>>
+<<sql:pg51g_on_change>>
+<<sql:pg51g_dummy_trigger>>
+<<sql:pg51g_freeze_trigger>>
+<<sql:pg51g_add_table>>
+<<sql:pg51g_rm_table>>
+<<sql:pg51g_diff_table>>
+<<sql:pg51g_do_table>>
+<<sql:pg51g_snap_table>>
+<<sql:pg51g_monitor_table>>
+<<sql:pg51g_unmonitor_table>>
+<<sql:pg51g_freeze_table>>
+<<sql:pg51g_unfreeze_table>>
+<<sql:pg51g_define_pkey>>
+<<sql:pg51g_define_val>>
+<<sql:pg51g_undef_pkey>>
+<<sql:pg51g_undef_val>>
+<<pg51g_create_metadata>>
+<<pg51g_create_alternatives>>
+<<pg51g_create_convenience>>
+
+@ Section 7: C code and associated SQL stubs
+@ -----------------------------------------------------------------------------------------------
+
+@ Note: all CLI-accessible functions use the Postgresql version-1 calling convention, which gives access to PG_ARGISNULL etc.
+
+@ pg51g.is_md5 accepts a single varchar argument and checks for two things:
+  * length of string needs to be exactly 32 bytes long
+  * all characters in the string must be valid hex digits (0-9,a-f)
+
+<<pg51g_is_md5>>=
+PG_FUNCTION_INFO_V1(is_md5);
+Datum is_md5(PG_FUNCTION_ARGS) {
+   if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); }
+   VarChar *value = PG_GETARG_VARCHAR_P(0);
+   unsigned int size = VARSIZE(value) - VARHDRSZ; int i;
+   if (size == 32) {
+      for(i=0; i<size; i++) { if(!isxdigit(VARDATA(value)[i])) { PG_RETURN_BOOL(0); } }
+      PG_RETURN_BOOL(1);
+   }
+   else { PG_RETURN_BOOL(0); }
+}
+
+<<sql:pg51g_is_md5>>=
+CREATE OR REPLACE FUNCTION pg51g.is_md5(VARCHAR) RETURNS BOOLEAN AS 'pg51g.so', 'is_md5' LANGUAGE 'C';
+
+
+@ This function may be called both as a standalone function which takes two varchar(32) arguments
+  containing md5 checksums (32 hex digits) and an aggregate function which operates on a single
+  varchar(32) transition variable. It checks all arguments and if any are null or not consistent
+  with an md5 value it returns a null value. Therefore, its definition as a STRICT function is not
+  necessary and should be avoided.
+
+@ The mechanism is pretty simple: every two chars from each argument are read in as hex digits
+  and converted into numeric values (bytes), which are then XOR-red and converted back to hex
+  digits (chars) for output. On my machine, ~2000000 rows are processed in ~16 seconds.
+
+<<pg51g_xor_md5>>=
+PG_FUNCTION_INFO_V1(xor_md5);
+Datum xor_md5(PG_FUNCTION_ARGS) {
+
+   int agg = 0; // has this function been called as an aggregate function? agg = 1 if it was, agg = 0 otherwise
+   if (fcinfo->context && IsA(fcinfo->context, AggState)) { agg = 1; }
+
+   /* let's check if the first argument is null - even if this is the first iteration of an aggregate, we expect all zeros not null */
+   if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); }
+
+   int i;
+   VarChar *state = PG_GETARG_VARCHAR_P(0);
+   unsigned int size1 = VARSIZE(state) - VARHDRSZ;
+   if (size1 == 32) { for(i=0; i<32; i++) { if(!isxdigit(VARDATA(state)[i])) { PG_RETURN_NULL(); } } } else { PG_RETURN_NULL(); }
+   /* if we have made it this far, we must have a valid first argument */
+
+   /* on to checking the second argument */
+   if (PG_ARGISNULL(1)) { PG_RETURN_NULL(); } // a single null will propagate to the very end if this is an aggregate call
+   VarChar *arg = PG_GETARG_VARCHAR_P(1);
+   unsigned int size2 = VARSIZE(arg) - VARHDRSZ;
+
+   /* checking if the variable arg points to what we expect (32 hex digits) */
+   if (size2 == 32) { for(i=0; i<32; i++) { if(!isxdigit(VARDATA(arg)[i])) { PG_RETURN_NULL(); } } } else { PG_RETURN_NULL(); }
+
+   // we convert each pair of chars in (state,arg) --> unsigned int values (bytes)
+   unsigned int bytes1[16]; unsigned int bytes2[16];
+   char *temp = (char *) palloc(2+1);
+   for(i=0; i < 16; i++) { memset(temp, 0, 2); strncpy(temp, &VARDATA(state)[i*2], 2); temp[2] = '\0'; sscanf(temp,"%x",&bytes1[i]); }
+   for(i=0; i < 16; i++) { memset(temp, 0, 2); strncpy(temp, &VARDATA(arg)[i*2], 2); temp[2] = '\0'; sscanf(temp,"%x",&bytes2[i]); }
+
+   // this is were we XOR each byte and produce the new chars
+   char *chars = (char *) palloc(32+1);
+   for(i=0; i<16; i++) { sprintf(&chars[i*2], "%02x", bytes1[i] ^ bytes2[i]); }
+
+   // if pg51g.xor_md5 is called as aggregate, we'll modify the first argument in place, else return a new value
+   if(agg) {
+      memcpy(VARDATA(state), chars, size2);
+      PG_RETURN_POINTER(state);
+   }
+   else {
+      int32 new_size = size2 + VARHDRSZ;
+      VarChar *new_varchar = (VarChar *) palloc(new_size);
+      SET_VARSIZE(new_varchar, new_size);
+      memcpy(VARDATA(new_varchar), chars, size2);
+      PG_RETURN_VARCHAR_P(new_varchar);
+   }
+}
+
+@ This is the SQL you need to define pg51g.xor_md5 in a Postgresql database. The first statement corresponds to the standalone
+  function, the second is an aggregate function definition which relies on the standalone version. The INITCOND is necessary
+  so that the first argument to pg51g.xor_md5 during the first iteration of the aggregate is not NULL (affecting the final result)
+
+<<sql:pg51g_xor_md5>>=
+CREATE OR REPLACE FUNCTION pg51g.xor_md5(VARCHAR(32),VARCHAR(32)) RETURNS VARCHAR(32) AS 'pg51g.so', 'xor_md5' LANGUAGE 'C';
+CREATE AGGREGATE pg51g.xor_md5 (VARCHAR(32)) (
+   SFUNC = pg51g.xor_md5,
+   STYPE = VARCHAR(32),
+   INITCOND = '00000000000000000000000000000000'
+);
+
+@ To implement block-folding of records into tables we need a grouping function -- pg51g.group_md5() sounds like a good name.
+  Once something's working, we could COUNT and GROUP BY and look at the distribution of records into groups (near uniform?)
+
+@ In order to implement folding by a constant factor, we need a bitwise AND operation between our md5 value and a number which
+  is calculated from the total number of records in the table and the folding factor (power of two).
+
+@ Thus, pg51g.group_md5 needs 2 arguments, the bit mask (varchar, <= 32 hex digits) and the md5 value (32 hex digits) -- returns int
+
+<<pg51g_group_md5>>=
+PG_FUNCTION_INFO_V1(group_md5);
+Datum group_md5(PG_FUNCTION_ARGS) {
+   if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); } if (PG_ARGISNULL(1)) { PG_RETURN_NULL(); }
+
+   VarChar *mask = PG_GETARG_VARCHAR_P(0);
+   VarChar *value = PG_GETARG_VARCHAR_P(1);
+
+   /* storing the size of the bit mask string in variable masksize -- we need to align the two strings for bitwise AND */
+   unsigned int masksize = VARSIZE(mask) - VARHDRSZ; int pad = 0; char *zero = (char *) palloc((1+1)*sizeof(char)); strncpy(zero, "0", 1);
+
+   if (masksize > 32) { PG_RETURN_NULL(); } // masksize should never be greater than 32
+   if (masksize % 2 > 0) { pad = 1; } // we need an even number of hex digits
+
+   /* just checking if input value is a valid md5 checksum (we expect 32 hex digits) */
+   unsigned int size = VARSIZE(value) - VARHDRSZ; int i;
+   if (size == 32) { for(i=0; i<32; i++) { if(!isxdigit(VARDATA(value)[i])) { PG_RETURN_NULL(); } } } else { PG_RETURN_NULL(); }
+
+   // we convert pairs of chars --> unsigned int values (bytes)
+   unsigned int bytes1[16]; unsigned int bytes2[16]; char *temp = (char *) palloc((2+1)*sizeof(char));
+
+   int pos = 16-(masksize+pad)/2; // we fill every array element up to this particular position with zero values
+
+   for(i=0; i < pos; i++) { bytes1[i] = 0; }
+   /* the following four lines are supposed to deal with odd masksize values */
+
+   if(pad) { memset(temp,0,2); strncpy(temp, &VARDATA(mask)[0], 1); temp[2] = '\0'; sscanf(temp,"%x",&bytes1[pos]); }
+   else { memset(temp,0,2); strncpy(temp, &VARDATA(mask)[0], 2); temp[2] = '\0'; sscanf(temp,"%x",&bytes1[pos]); }
+
+   for(i=pos+1; i<16; i++) { memset(temp,0,2); strncpy(temp,&VARDATA(mask)[(i-pos)*2-pad],2); temp[2] = '\0'; sscanf(temp,"%x",&bytes1[i]); }
+
+   /* on to populating bytes2 -- we don't need to worry about an odd number of hex digits here */
+   for(i=0; i < 16; i++) { memset(temp, 0, 2); strncpy(temp, &VARDATA(value)[i*2], 2); temp[2] = '\0'; sscanf(temp,"%x",&bytes2[i]); }
+
+   // this is where we apply the bit mask through an AND operation and produce the new chars
+   char *chars = (char *) palloc((32+1)*sizeof(char));
+   for(i=0; i<16; i++) { sprintf(&chars[i*2], "%02x", bytes1[i] & bytes2[i]); }
+   chars[32] = '\0';
+
+   int32 new_size = size + VARHDRSZ;
+   VarChar *new_varchar = (VarChar *) palloc(new_size);
+   SET_VARSIZE(new_varchar, new_size);
+   memcpy(VARDATA(new_varchar), chars, size);
+   PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_group_md5>>=
+CREATE OR REPLACE FUNCTION pg51g.group_md5(VARCHAR, VARCHAR) RETURNS VARCHAR AS 'pg51g.so', 'group_md5' LANGUAGE 'C' IMMUTABLE;
+
+@ Now that we have a grouping function, we may proceed to building and populating summary tables.
+  All this is done at the table level, i.e. the only information we need is a target table
+
+@ target relation (whether it's a table, view or temp table) needs to exist when add_table() is called
+
+<<pg51g_add_table>>=
+PG_FUNCTION_INFO_V1(add_table);
+Datum add_table(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); } 
+
+    VarChar *sql = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(sql) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); int ret; char *res = (char *) palloc(8192);
+    strncpy(buf,VARDATA(sql),size); buf[size] = '\0'; // converting varchar into native string
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    // if the table has been already added to the metadata table, return null
+    if( table_in_metadata(schname, tblname)  ) {
+        elog(ERROR, "[pg51g] add_table('%s'): already exists in pg51g.metadata", buf);
+        PG_RETURN_NULL();
+    }
+
+    char *pkey = pkey_text(schname, tblname);
+    char *val = val_text(schname, tblname);
+
+    // if the table doesn't exist, has no primary key or no pkey,val definitions in the alternatives table, return null
+    if( !( strlen(pkey) > 0 && strlen(val) > 0 )  ) {
+        elog(ERROR, "[pg51g] add_table('%s'): does this table have a primary key?", buf);
+        PG_RETURN_NULL();
+    }
+
+    char *string = "SELECT COUNT(*) FROM %s;";
+    int csql_s = strlen(string) + strlen(buf) + 1;
+    char *csql = (char *) palloc (csql_s + 1); sprintf(csql, string, buf);
+    char *count = return_val(csql); int trows = 0; sscanf(count,"%d",&trows);
+
+    // Getting folding depth for this record count
+    int depth = get_depth(trows);
+
+    // schema-related stuff... [maybe]
+    // CREATE VIEW pg51g.public_test1_columns AS SELECT ordinal_position, column_name, data_type, is_nullable, column_default, is_updatable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'test1' ORDER BY ordinal_position;
+
+    char *sigtbl = get_sig_target(schname, tblname);
+
+    // generating the signature table -- false as last argument will create TEMPORARY signature table
+    res = process_table(schname, tblname, pkey, val, depth, sigtbl, true);
+
+    // registering the new signature table in the metadata table
+    char *reg = reg_table(schname, tblname, pkey, val, depth, !table_is_temp(tblname), table_is_view(schname, tblname));
+
+    int trig_s = strlen(schname) + strlen(tblname) + 17;
+    char *trig = (char *) palloc (trig_s + 1);
+    sprintf(trig, "pg51g_%s_%s_on_change", schname, tblname);
+
+    // the trigger may already exist in the system
+    char *string1 = "SELECT COUNT(*) FROM pg_trigger WHERE tgname = '%s';";
+    int tgl_s = strlen(string1) + strlen(trig) - 2;
+    char *tgl = (char *) palloc (tgl_s + 1);
+    sprintf(tgl, string1, trig);
+    char *returned = return_val(tgl); int rows = 0; sscanf(returned,"%d",&rows);
+
+    // what if our relation is a view? we should skip the trigger installation
+    if ( !( rows > 0 || table_is_view(schname, tblname) || table_is_temp(tblname) ) ) { res = install_trigger(schname, tblname); }
+
+    int res_s = strlen(sigtbl);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), sigtbl, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_add_table>>=
+CREATE OR REPLACE FUNCTION pg51g.add(varchar) RETURNS VARCHAR AS 'pg51g.so', 'add_table' LANGUAGE 'C';
+
+<<pg51g_rm_table>>=
+PG_FUNCTION_INFO_V1(rm_table);
+Datum rm_table(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); } 
+
+    VarChar *sql = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(sql) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); int ret; char *res = (char *) palloc(8192);
+    strncpy(buf,VARDATA(sql),size); buf[size] = '\0'; // converting varchar into native string
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    // if the table is not in the metadata table, return null -- but check for temporary tables, too
+    if( !table_in_metadata(schname, tblname) ) {
+        if( table_in_metadata("pg_temp_1", tblname) ) { schname = "pg_temp_1"; }
+        else {
+            elog(ERROR, "[pg51g] rm_table('%s'): no such entry in pg51g.metadata", buf);
+            PG_RETURN_NULL();
+        }
+    }
+
+    // char *sigtbl; if( table_persists(schname, tblname) ) { sigtbl = "true"; } else { sigtbl = "false"; }
+
+    // 1. getting rid of the trigger
+
+    int trig_s = strlen(schname) + strlen(tblname) + 17;
+    char *trig = (char *) palloc (trig_s + 1);
+    sprintf(trig, "pg51g_%s_%s_on_change", schname, tblname);
+
+    char *string1 = "SELECT COUNT(*) FROM pg_trigger WHERE tgname = '%s';";
+    int csql_s = strlen(string1) + strlen(trig) - 2;
+    char *csql = (char *) palloc (csql_s + 1);
+    sprintf(csql, string1, trig);
+    char *returned = return_val(csql); int rows = 0; sscanf(returned,"%d",&rows);
+
+    if ( rows > 0 ) { res = remove_trigger(schname, tblname); }
+
+    // 2. drop the signatures table
+
+    char *sigtbl = read_sig_table(schname, tblname);
+    char *string2 = "DROP TABLE IF EXISTS pg51g.%s;";
+    int dsql_s = strlen(string2) + strlen(sigtbl) - 2;
+    char *dsql = (char *) palloc (dsql_s + 1);
+    sprintf(dsql, string2, sigtbl);
+    char *dres = return_val(dsql);
+
+    // 3. delete the metadata entry
+
+    char *mres = unreg_table(schname, tblname);
+
+    int res_s = strlen(sigtbl);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), sigtbl, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_rm_table>>=
+CREATE OR REPLACE FUNCTION pg51g.del(varchar) RETURNS VARCHAR AS 'pg51g.so', 'rm_table' LANGUAGE 'C';
+
+<<pg51g_snap_table>>=
+PG_FUNCTION_INFO_V1(snap_table);
+Datum snap_table(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); } 
+
+    VarChar *sql = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(sql) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); int ret;
+    strncpy(buf,VARDATA(sql),size); buf[size] = '\0'; // converting varchar into native string
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    // if the table has been already added to the metadata table, return null
+    if( !table_in_metadata(schname, tblname)  ) {
+        elog(ERROR, "[pg51g] snap_table('%s'): does not exist in pg51g.metadata", buf);
+        PG_RETURN_NULL();
+    }
+
+    char *target = get_snap_target(schname, tblname); char *res;
+    if ( table_exists( get_schema(target), get_table(target) ) ) { res = sync_saved(schname, tblname); }
+	else { res = save_table(schname, tblname); }
+
+    int res_s = strlen(res);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_snap_table>>=
+CREATE OR REPLACE FUNCTION pg51g.snap(varchar) RETURNS VARCHAR AS 'pg51g.so', 'snap_table' LANGUAGE 'C';
+
+<<pg51g_diff_table>>=
+
+typedef struct {
+    int pos;
+    int capacity;
+    char **keys;
+    char **ops;
+    char **matched;
+} dlist;
+
+dlist * new_dlist()
+{
+    dlist *g = (dlist *) palloc( sizeof(dlist) );
+    g->pos = 0;
+    g->capacity = 4;
+    g->keys = (char**)palloc(4 * sizeof(char*));
+    g->ops = (char**)palloc(4 * sizeof(char*));
+    g->matched = (char**)palloc(4 * sizeof(char*));
+    return g;
+}
+
+dlist * clone_dlist(dlist *old)
+{
+    dlist *g = (dlist *) palloc( old->capacity * sizeof(dlist) );
+    g->pos = old->pos;
+    g->capacity = old->capacity;
+    g->keys = (char**)palloc( old->capacity * sizeof(char*));
+    g->ops = (char**)palloc( old->capacity * sizeof(char*));
+    g->matched = (char**)palloc( old->capacity * sizeof(char*));
+    int i;
+    for(i=0; i < g->pos; i++) {
+        g->keys[i] = old->keys[i];
+        g->ops[i] = old->ops[i];
+        g->matched[i] = old->matched[i];
+    }
+    return g;
+}
+
+void del_dlist(dlist *g)
+{
+    g->capacity = 0;
+    g->pos = 0;
+    pfree(g->keys);
+    pfree(g->ops);
+    pfree(g->matched);
+    pfree(g);
+}
+
+void add_to_dlist (dlist *g, char * pri, char * op)
+{
+    if (g->pos == g->capacity) {
+        int newcapacity = g->capacity * 2; int i;
+        char ** newkeys = (char**)palloc(newcapacity * sizeof(char*));
+        char ** newops  = (char**)palloc(newcapacity * sizeof(char*));
+        char ** newmatched  = (char**)palloc(newcapacity * sizeof(char*));
+        for(i=0; i < g->capacity; i++) { newkeys[i] = g->keys[i]; newops[i] = g->ops[i]; newmatched[i] = g->matched[i]; }
+        pfree(g->keys); pfree(g->ops); pfree(g->matched);
+        g->capacity = newcapacity;
+        g->keys = newkeys; g->ops = newops; g->matched = newmatched;
+    }
+    int pos = g->pos;
+    g->keys[pos] = pri;
+    g->ops[pos] = op;
+    g->matched[pos] = "f";
+    g->pos++;
+}
+
+void append_dlist(dlist *g, dlist *new)
+{
+    int elements = new->pos; int i;
+    for(i=0; i < elements; i++) { add_to_dlist(g, new->keys[i], new->ops[i]); }
+}
+
+int get_dlist_current_pos (dlist *g) { return g->pos; }
+
+char * get_dlist_key (dlist *g, int pos) { return g->keys[pos]; }
+char * get_dlist_op (dlist *g, int pos) { return g->ops[pos]; }
+
+void set_dlist_matched (dlist *g, int pos) { g->matched[pos] = "t"; }
+
+bool get_dlist_matched (dlist *g, int pos) {
+    char *m = g->matched[pos]; if( !abs(strcmp(m, "f")) ) { return false; } else { return true; }
+}
+
+dlist * getRecordsForGroup(MemoryContext ctx, char *tbl, int level, char *mask, char *pri)
+{
+    MemoryContext orig_ctx;
+
+    char *string = "SELECT * FROM %s WHERE level = %d AND '%s' = pg51g.group_md5('%s',key) ORDER BY pri, key, val;";
+    char *sql = (char *) palloc( strlen(string) + strlen(tbl) + strlen(mask) + strlen(pri) + 2 );
+    sprintf(sql, string, tbl, level, pri, mask); int ret, proc, i;
+
+    if ((ret = SPI_connect()) < 0) { ereport(ERROR,
+                                                   ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                                     errmsg("[pg51g] getRecordsForGroup: connection error"),
+                                                     errhint("pg51g_getRecordsForGroup could not SPI connect!")  )
+                                     );
+    }
+
+    /* trying to execute sql */
+    ret = SPI_exec(sql,0);
+    if (ret < 0) { ereport(ERROR,
+                                  ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                    errmsg("[pg51g] getRecordsForGroup: sql error"),
+                                    errhint("Please be careful about the SQL you throw at pg51g_getRecordsForGroup!")  )
+                          );
+    }
+
+    proc = SPI_processed;
+
+    orig_ctx = MemoryContextSwitchTo(ctx);
+
+    dlist *dl = new_dlist();
+    char *mypri, *mykey;
+
+    MemoryContextSwitchTo(orig_ctx);
+
+    if (SPI_tuptable != NULL && proc > 0)
+    {
+        TupleDesc tupdesc = SPI_tuptable->tupdesc;
+        SPITupleTable *tuptable = SPI_tuptable;
+        for (i=0; i<proc; i++) {
+            HeapTuple tuple = tuptable->vals[i];
+            if (!(tuple == 0)) {
+                char *temppri = SPI_getvalue(tuple, tupdesc, 2);
+                char *tempkey = SPI_getvalue(tuple, tupdesc, 4);
+
+                orig_ctx = MemoryContextSwitchTo(ctx);
+
+                mypri = palloc( strlen(temppri) + 1 ); sprintf(mypri,"%s",temppri);
+                mykey = palloc( strlen(tempkey) + 1 ); sprintf(mykey,"%s",tempkey);
+
+                add_to_dlist(dl, mypri, mykey);
+
+                MemoryContextSwitchTo(orig_ctx);
+
+            }
+        }
+    }
+    SPI_finish();
+
+    return dl;
+}
+
+dlist * diff_dlists(dlist *saved, dlist *current)
+{
+    int refsize = get_dlist_current_pos(saved);
+    int proc = get_dlist_current_pos(current);
+    int i, k;
+
+    dlist *dl = new_dlist();
+
+    for (i=0; i<proc; i++) {
+        char *mypri = get_dlist_key(current, i);
+        char *mykey = get_dlist_op(current, i);
+
+        // hasPri --> looking for INSERTions
+        bool matched = false;
+        for(k=0; k<refsize; k++) {
+                char *refpri = get_dlist_key(saved, k);
+                if ( !abs(strcmp(mypri, refpri)) ) { matched = true; set_dlist_matched(saved, k); break;  }
+        }
+        if (!matched) { add_to_dlist(dl, mypri, "INSERT"); }
+        else { // hasA --> looking for UPDATEs
+            bool upmatched = false;
+            for(k=0; k<refsize; k++) {
+                    char *refpri = get_dlist_key(saved, k);
+                    char *refkey = get_dlist_op(saved, k);
+                    if ( !abs(strcmp(mypri, refpri)) && !abs(strcmp(mykey, refkey)) ) { upmatched = true; break; }
+            }
+            if (!upmatched) { add_to_dlist(dl, mypri, "UPDATE"); }
+        }
+
+    }
+    // getUnmatched --> looking for DELETEions
+    for(k=0; k<refsize; k++) { if (!get_dlist_matched(saved, k)) { add_to_dlist(dl, get_dlist_key(saved,k), "DELETE"); } }
+
+    return dl;
+}
+
+PG_FUNCTION_INFO_V1(diff_table);
+Datum diff_table(PG_FUNCTION_ARGS)
+{
+    FuncCallContext *srf;
+    int              call_cntr;
+    int              max_calls;
+    TupleDesc        tupdesc;
+    AttInMetadata   *attinmeta;
+    dlist           *dl, *pris, *saved, *current, *diff, *tmp;
+    MemoryContext    oldcontext;
+
+    if( SRF_IS_FIRSTCALL() )
+    {
+        /* create a function context for cross-call persistence */
+        srf = SRF_FIRSTCALL_INIT();
+
+        oldcontext = MemoryContextSwitchTo(srf->multi_call_memory_ctx);
+
+        VarChar *sql = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(sql) - VARHDRSZ;
+        char *buf = (char *) palloc(size+1);
+        strncpy(buf,VARDATA(sql),size); buf[size] = '\0'; // converting varchar into native string
+
+        MemoryContextSwitchTo(oldcontext);
+
+        char *tblname = get_table(buf);
+        char *schname = get_schema(buf);
+
+        oldcontext = MemoryContextSwitchTo(srf->multi_call_memory_ctx);
+
+        /* Build a tuple descriptor for our result type */
+        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                      errmsg("function returning record called in context "
+                             "that cannot accept type record")));
+
+        attinmeta = TupleDescGetAttInMetadata(tupdesc);
+        srf->attinmeta = attinmeta;
+
+        // Storing state for subsequent invocations 
+
+        dl = new_dlist();
+        srf->user_fctx = (dlist *) dl;
+
+        MemoryContextSwitchTo(oldcontext);
+
+        char *saved_tbl = get_snap_target(schname, tblname);
+        char *current_tbl = get_sig_target(schname, tblname);
+
+        int depth = read_depth(buf); int level, mysize, i, k; char *mask; bool ops = true;
+
+        /* until we decide what to do when depth < 0 */
+        if (depth < 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                      errmsg("Attempting to diff a table with depth < 0"
+                             " -- stopping right here")));
+
+        pris = new_dlist();
+        add_to_dlist(pris, "00000000000000000000000000000000", "00000000000000000000000000000000");
+
+        for(level=depth+1; level > 0; level--) {
+
+            diff = new_dlist();
+            mask = get_mask(depth, level);
+            mysize = get_dlist_current_pos(pris);
+
+            for(i=0; i<mysize; i++) {
+                char *pri = get_dlist_key(pris, i);
+                // saved = null;
+                saved = getRecordsForGroup(CurrentMemoryContext, saved_tbl, level-1, mask, pri);
+                current = getRecordsForGroup(CurrentMemoryContext, current_tbl, level-1, mask, pri);
+                tmp = diff_dlists(saved, current);
+                append_dlist(diff, tmp);
+                del_dlist(saved); del_dlist(current); del_dlist(tmp);
+            }
+            
+            del_dlist(pris); pris = clone_dlist(diff); del_dlist(diff);
+        }
+
+        // populating the result list with the items in *pris
+
+        mysize = get_dlist_current_pos(pris);
+        for(i=0; i<mysize; i++) { add_to_dlist( dl, get_dlist_key(pris, i), get_dlist_op(pris, i) ); }
+
+        oldcontext = MemoryContextSwitchTo(srf->multi_call_memory_ctx);
+
+        srf->max_calls = get_dlist_current_pos(dl);
+        srf->call_cntr = 0;
+
+        MemoryContextSwitchTo(oldcontext);
+
+        pfree(buf); pfree(tblname); pfree(schname); pfree(saved_tbl); pfree(mask);
+   }
+
+   /* stuff done on every call of the function */
+   srf = SRF_PERCALL_SETUP();
+
+   call_cntr = srf->call_cntr;
+   max_calls = srf->max_calls;
+   attinmeta = srf->attinmeta;
+   dl = (dlist *)srf->user_fctx;
+
+   if (call_cntr < max_calls)     /* do when there is more left to send */
+   {
+       char       **values;
+       HeapTuple    tuple;
+       Datum        result;
+       /*
+        * Prepare a values array for building the returned tuple.
+        * This should be an array of C strings which will
+        * be processed later by the type input functions.
+        */
+       values = (char **) palloc(2 * sizeof(char *));
+       values[0] = (char *) palloc(128 * sizeof(char));
+       values[1] = (char *) palloc(128 * sizeof(char));
+
+       snprintf(values[0], 128, "%s", get_dlist_key(dl, call_cntr) );
+       snprintf(values[1], 128, "%s", get_dlist_op(dl, call_cntr) );
+
+       /* build a tuple */
+       tuple = BuildTupleFromCStrings(attinmeta, values);
+
+       /* make the tuple into a datum */
+       result = (Datum) HeapTupleGetDatum(tuple);
+
+       /* clean up (this is not really necessary) */
+       pfree(values[0]);
+       pfree(values[1]);
+       pfree(values);
+
+       SRF_RETURN_NEXT(srf, result);
+   }
+   else    /* do when there is no more left */
+   {
+       del_dlist( dl );
+       SRF_RETURN_DONE(srf);
+   }
+}
+
+static char * sync_saved (char * schname, char * tblname)
+{
+    dlist           *pris, *saved, *current, *diff, *tmp;
+
+    char *saved_tbl = get_snap_target(schname, tblname);
+    char *current_tbl = get_sig_target(schname, tblname);
+	int t_size = strlen(schname) + strlen(tblname) + 2;
+	char *buf = (char *) palloc(t_size * sizeof(char));
+	sprintf(buf, "%s.%s", schname, tblname);
+
+    int depth = read_depth(buf); int level, mysize, tempsize, i, k, j; char *mask; bool ops = true;
+
+    /* until we decide what to do when depth < 0 */
+    if (depth < 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                  errmsg("Attempting to diff a table with depth < 0"
+                         " -- stopping right here")));
+
+    pris = new_dlist();
+    add_to_dlist(pris, "00000000000000000000000000000000", "00000000000000000000000000000000");
+
+    for(level=depth+1; level > 0; level--) {
+
+        diff = new_dlist();
+        mask = get_mask(depth, level);
+        mysize = get_dlist_current_pos(pris);
+
+        for(i=0; i<mysize; i++) {
+            char *pri = get_dlist_key(pris, i);
+            // saved = null;
+            saved = getRecordsForGroup(CurrentMemoryContext, saved_tbl, level-1, mask, pri);
+            current = getRecordsForGroup(CurrentMemoryContext, current_tbl, level-1, mask, pri);
+            tmp = diff_dlists(saved, current);
+            append_dlist(diff, tmp);
+            del_dlist(saved); del_dlist(current); del_dlist(tmp);
+        }
+
+        del_dlist(pris); pris = clone_dlist(diff); del_dlist(diff);
+		tempsize = get_dlist_current_pos(pris);
+    	for(j=0; j<tempsize; j++) { sync_saved_row( current_tbl, saved_tbl, get_dlist_op( pris, j ), get_dlist_key( pris, j ), level-1 ); }
+    }
+
+	del_dlist(pris); pfree(buf); pfree(current_tbl); pfree(saved_tbl); pfree(mask);
+
+	return "sync_saved";
+}
+
+static char * sync_saved_and_do (char * schname, char * tblname, int (*proc)(char *, char *, char *, char *, int))
+{
+    dlist           *pris, *saved, *current, *diff, *tmp;
+
+    char *saved_tbl = get_snap_target(schname, tblname);
+    char *current_tbl = get_sig_target(schname, tblname);
+	int t_size = strlen(schname) + strlen(tblname) + 2;
+	char *buf = (char *) palloc(t_size * sizeof(char));
+	sprintf(buf, "%s.%s", schname, tblname);
+
+    int depth = read_depth(buf); int level, mysize, tempsize, i, k, j; char *mask; bool ops = true;
+
+    /* until we decide what to do when depth < 0 */
+    if (depth < 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                  errmsg("Attempting to diff a table with depth < 0"
+                         " -- stopping right here")));
+
+    pris = new_dlist();
+    add_to_dlist(pris, "00000000000000000000000000000000", "00000000000000000000000000000000");
+
+    for(level=depth+1; level > 0; level--) {
+
+        diff = new_dlist();
+        mask = get_mask(depth, level);
+        mysize = get_dlist_current_pos(pris);
+
+        for(i=0; i<mysize; i++) {
+            char *pri = get_dlist_key(pris, i);
+            // saved = null;
+            saved = getRecordsForGroup(CurrentMemoryContext, saved_tbl, level-1, mask, pri);
+            current = getRecordsForGroup(CurrentMemoryContext, current_tbl, level-1, mask, pri);
+            tmp = diff_dlists(saved, current);
+            append_dlist(diff, tmp);
+            del_dlist(saved); del_dlist(current); del_dlist(tmp);
+        }
+
+        del_dlist(pris); pris = clone_dlist(diff); del_dlist(diff);
+		tempsize = get_dlist_current_pos(pris);
+    	for(j=0; j<tempsize; j++) { sync_saved_row( current_tbl, saved_tbl, get_dlist_op( pris, j ), get_dlist_key( pris, j ), level-1 ); }
+    }
+
+	tempsize = get_dlist_current_pos(pris);
+   	for(j=0; j<tempsize; j++) { int rc = (*(proc))( current_tbl, saved_tbl, get_dlist_op( pris, j ), get_dlist_key( pris, j ), level ); }
+
+	del_dlist(pris); pfree(buf); pfree(current_tbl); pfree(saved_tbl); pfree(mask);
+
+	return "sync_saved_and_do";
+}
+
+PG_FUNCTION_INFO_V1(diff_push);
+Datum diff_push(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); } 
+
+    VarChar *sql = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(sql) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); int ret;
+    strncpy(buf,VARDATA(sql),size); buf[size] = '\0'; // converting varchar into native string
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    // if the table has been already added to the metadata table, return null
+    if( !table_in_metadata(schname, tblname)  ) {
+        elog(ERROR, "[pg51g] diff_push('%s'): does not exist in pg51g.metadata", buf);
+        PG_RETURN_NULL();
+    }
+
+    char *target = get_snap_target(schname, tblname); char *res;
+    if ( table_exists( get_schema(target), get_table(target) ) ) { res = sync_saved_and_do(schname, tblname, &test_push); }
+	else { PG_RETURN_NULL(); }
+
+    int res_s = strlen(res);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_diff_table>>=
+CREATE OR REPLACE FUNCTION pg51g.diff(IN VARCHAR, OUT key VARCHAR, OUT op VARCHAR) RETURNS SETOF RECORD AS 'pg51g.so', 'diff_table' LANGUAGE 'C';
+CREATE OR REPLACE FUNCTION pg51g.push(varchar) RETURNS VARCHAR AS 'pg51g.so', 'diff_push' LANGUAGE 'C';
+
+<<pg51g_do_table>>=
+PG_FUNCTION_INFO_V1(do_table);
+Datum do_table(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); } 
+
+    VarChar *sql = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(sql) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); int ret;
+    strncpy(buf,VARDATA(sql),size); buf[size] = '\0'; // converting varchar into native string
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+   // if the relation cannot be found in the metadata table...
+    if( !table_in_metadata(schname, tblname)  ) {
+        // it could be a temp relation that doesn't exist anymore
+        if ( table_in_metadata("pg_temp_1", tblname) ) { pfree(schname); schname = palloc(10); strcpy(schname, "pg_temp_1"); }
+        else {
+            // or we'll just complain and return
+            elog(ERROR, "[pg51g] do_table('%s'): does not exist in pg51g.metadata", buf);
+            PG_RETURN_NULL();
+        }
+    }
+
+    char *key = read_pkey_sql(schname, tblname);
+    char *val = read_val_sql(schname, tblname);
+    int depth = read_depth(buf);
+    char *sigtbl = get_sig_target(schname, tblname);
+
+    bool perm = read_persists(schname, tblname); char *res; res = sigtbl;
+
+    if( read_is_view(schname, tblname) ) {
+        // recreating the TEMP view if it's not there
+        if( !perm ) {
+            drop_if_exists( schname, tblname );
+            char *def = read_table_def(schname, tblname);
+            return_val(def);
+        }
+        // replacing an existing sigtbl with a fresh one
+        drop_if_exists( get_schema(sigtbl), get_table(sigtbl) ); // getting rid of the table, if it's already there
+        process_table (schname, tblname, key, val, depth, sigtbl, true);
+    }
+    else {
+        if (!perm) { 
+            drop_if_exists( get_schema(sigtbl), get_table(sigtbl) ); // getting rid of the table, if it's already there
+            process_table (schname, tblname, key, val, depth, sigtbl, true);
+        }
+    }
+
+    int res_s = strlen(res);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_do_table>>=
+CREATE OR REPLACE FUNCTION pg51g.do(varchar) RETURNS VARCHAR AS 'pg51g.so', 'do_table' LANGUAGE 'C';
+
+<<pg51g_monitor_table>>=
+PG_FUNCTION_INFO_V1(monitor_table);
+Datum monitor_table(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); }
+
+    VarChar *name = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(name) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); strncpy(buf,VARDATA(name),size); buf[size] = '\0';
+
+    int ret; char *res;
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    int trig_s = strlen(schname) + strlen(tblname) + 17;
+    char *trig = (char *) palloc (trig_s + 1);
+    sprintf(trig, "pg51g_%s_%s_on_change", schname, tblname);
+
+    char *string1 = "SELECT COUNT(*) FROM pg_trigger WHERE tgname = '%s';";
+    int sql_s = strlen(string1) + strlen(trig) - 2;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string1, trig);
+    char *returned = return_val(sql); int rows = 0; sscanf(returned,"%d",&rows);
+
+    if ( !(rows > 0) ) {
+         res = install_trigger(schname, tblname);
+    }
+    else {
+         int ret_s = strlen(trig) + 8;
+         res = palloc(ret_s + 1);
+         strcpy(res, trig); strcat(res, " exists!");
+         PG_RETURN_NULL();
+    }
+
+    int res_s = strlen(res);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_monitor_table>>=
+CREATE OR REPLACE FUNCTION pg51g.monitor_table(varchar) RETURNS VARCHAR AS 'pg51g.so', 'monitor_table' LANGUAGE 'C';
+
+<<pg51g_unmonitor_table>>=
+PG_FUNCTION_INFO_V1(unmonitor_table);
+Datum unmonitor_table(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); }
+
+    VarChar *name = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(name) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); strncpy(buf,VARDATA(name),size); buf[size] = '\0';
+
+    int ret; char *res;
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    int trig_s = strlen(schname) + strlen(tblname) + 17;
+    char *trig = (char *) palloc (trig_s + 1);
+    sprintf(trig, "pg51g_%s_%s_on_change", schname, tblname);
+
+    char *string1 = "SELECT COUNT(*) FROM pg_trigger WHERE tgname = '%s';";
+    int sql_s = strlen(string1) + strlen(trig) - 2;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string1, trig);
+    char *returned = return_val(sql); int rows = 0; sscanf(returned,"%d",&rows);
+    char *string2;
+
+    if ( rows > 0 ) {
+         res = remove_trigger(schname, tblname);
+    }
+    else {
+         int ret_s = strlen(trig) + 15;
+         res = palloc(ret_s + 1);
+         strcpy(res, trig); strcat(res, " does not exist!");
+         PG_RETURN_NULL();
+    }
+
+    int res_s = strlen(res);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_unmonitor_table>>=
+CREATE OR REPLACE FUNCTION pg51g.unmonitor_table(varchar) RETURNS VARCHAR AS 'pg51g.so', 'unmonitor_table' LANGUAGE 'C';
+
+<<pg51g_freeze_table>>=
+PG_FUNCTION_INFO_V1(freeze_table);
+Datum freeze_table(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); }
+
+    VarChar *name = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(name) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); strncpy(buf,VARDATA(name),size); buf[size] = '\0';
+
+    int ret; char *res;
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    int trig_s = strlen(schname) + strlen(tblname) + 17;
+    char *trig = (char *) palloc (trig_s + 1);
+    sprintf(trig, "pg51g_%s_%s_freeze", schname, tblname);
+
+    char *string1 = "SELECT COUNT(*) FROM pg_trigger WHERE tgname = '%s';";
+    int sql_s = strlen(string1) + strlen(trig) - 2;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string1, trig);
+    char *returned = return_val(sql); int rows = 0; sscanf(returned,"%d",&rows);
+
+    if ( !(rows > 0) ) {
+         res = install_freeze(schname, tblname);
+    }
+    else {
+         int ret_s = strlen(trig) + 8;
+         res = palloc(ret_s + 1);
+         strcpy(res, trig); strcat(res, " exists!");
+         PG_RETURN_NULL();
+    }
+
+    int res_s = strlen(res);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_freeze_table>>=
+CREATE OR REPLACE FUNCTION pg51g.freeze_table(varchar) RETURNS VARCHAR AS 'pg51g.so', 'freeze_table' LANGUAGE 'C';
+
+<<pg51g_unfreeze_table>>=
+PG_FUNCTION_INFO_V1(unfreeze_table);
+Datum unfreeze_table(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); }
+
+    VarChar *name = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(name) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); strncpy(buf,VARDATA(name),size); buf[size] = '\0';
+
+    int ret; char *res;
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    int trig_s = strlen(schname) + strlen(tblname) + 17;
+    char *trig = (char *) palloc (trig_s + 1);
+    sprintf(trig, "pg51g_%s_%s_freeze", schname, tblname);
+
+    char *string1 = "SELECT COUNT(*) FROM pg_trigger WHERE tgname = '%s';";
+    int sql_s = strlen(string1) + strlen(trig) - 2;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string1, trig);
+    char *returned = return_val(sql); int rows = 0; sscanf(returned,"%d",&rows);
+    char *string2;
+
+    if ( rows > 0 ) {
+         res = remove_freeze(schname, tblname);
+    }
+    else {
+         int ret_s = strlen(trig) + 15;
+         res = palloc(ret_s + 1);
+         strcpy(res, trig); strcat(res, " does not exist!");
+         PG_RETURN_NULL();
+    }
+
+    int res_s = strlen(res);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_unfreeze_table>>=
+CREATE OR REPLACE FUNCTION pg51g.unfreeze_table(varchar) RETURNS VARCHAR AS 'pg51g.so', 'unfreeze_table' LANGUAGE 'C';
+
+<<pg51g_define_pkey>>=
+PG_FUNCTION_INFO_V1(define_pkey);
+Datum define_pkey(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); } if (PG_ARGISNULL(1)) { PG_RETURN_NULL(); } 
+
+    VarChar *name = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(name) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); strncpy(buf,VARDATA(name),size); buf[size] = '\0';
+
+    VarChar *pkey = PG_GETARG_VARCHAR_P(1); unsigned int pkey_s = VARSIZE(pkey) - VARHDRSZ;
+    char *arg = (char *) palloc(pkey_s+1); strncpy(arg,VARDATA(pkey),pkey_s); arg[pkey_s] = '\0';
+
+    char *earg = escape_quotes(arg); // perhaps we want some delimiters in our concatenation
+
+    int ret; char *res;
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    char *string1 = "SELECT COUNT(*) FROM pg51g.alternatives WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string1) + strlen(schname) + strlen(tblname);
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string1, schname, tblname);
+    char *returned = return_val(sql); int rows = 0; sscanf(returned,"%d",&rows);
+    char *string2;
+
+    if ( rows > 0 ) {
+         string2 = "UPDATE pg51g.alternatives SET t_key_sql = '%s' WHERE t_schema = '%s' AND t_table = '%s';";
+         int update_s = strlen(string2) + strlen(earg) + strlen(schname) + strlen(tblname) - 6;
+         char *update = (char *) palloc (update_s + 1);
+         sprintf(update, string2, earg, schname, tblname);
+         char *ret = return_val(update); res = "UPDATED";
+    }
+    else {
+         string2 = "INSERT INTO pg51g.alternatives VALUES ('%s', '%s', '%s', NULL);";
+         int insert_s = strlen(string2) + strlen(earg) + strlen(schname) + strlen(tblname) - 6;
+         char *insert = (char *) palloc (insert_s + 1);
+         sprintf(insert, string2, schname, tblname, earg);
+         char *ret = return_val(insert); res = "INSERTED";
+    }
+
+    int res_s = strlen(res);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_define_pkey>>=
+CREATE OR REPLACE FUNCTION pg51g.key(varchar, varchar) RETURNS VARCHAR AS 'pg51g.so', 'define_pkey' LANGUAGE 'C';
+
+<<pg51g_define_val>>=
+PG_FUNCTION_INFO_V1(define_val);
+Datum define_val(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); } if (PG_ARGISNULL(1)) { PG_RETURN_NULL(); } 
+
+    VarChar *name = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(name) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); strncpy(buf,VARDATA(name),size); buf[size] = '\0';
+
+    VarChar *val = PG_GETARG_VARCHAR_P(1); unsigned int val_s = VARSIZE(val) - VARHDRSZ;
+    char *arg = (char *) palloc(val_s+1); strncpy(arg,VARDATA(val),val_s); arg[val_s] = '\0';
+
+    int ret; char *res;
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    char *string1 = "SELECT COUNT(*) FROM pg51g.alternatives WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string1) + strlen(schname) + strlen(tblname);
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string1, schname, tblname);
+    char *returned = return_val(sql); int rows = 0; sscanf(returned,"%d",&rows);
+    char *string2;
+
+    if ( rows > 0 ) {
+         string2 = "UPDATE pg51g.alternatives SET t_val_sql = '%s' WHERE t_schema = '%s' AND t_table = '%s';";
+         int update_s = strlen(string2) + strlen(arg) + strlen(schname) + strlen(tblname) - 6;
+         char *update = (char *) palloc (update_s + 1);
+         sprintf(update, string2, arg, schname, tblname);
+         char *ret = return_val(update); res = "UPDATED";
+    }
+    else {
+         string2 = "INSERT INTO pg51g.alternatives VALUES ('%s', '%s', NULL, '%s');";
+         int insert_s = strlen(string2) + strlen(arg) + strlen(schname) + strlen(tblname) - 6;
+         char *insert = (char *) palloc (insert_s + 1);
+         sprintf(insert, string2, schname, tblname, arg);
+         char *ret = return_val(insert); res = "INSERTED";
+    }
+
+    int res_s = strlen(res);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_define_val>>=
+CREATE OR REPLACE FUNCTION pg51g.val(varchar, varchar) RETURNS VARCHAR AS 'pg51g.so', 'define_val' LANGUAGE 'C';
+
+<<pg51g_undef_pkey>>=
+PG_FUNCTION_INFO_V1(undef_pkey);
+Datum undef_pkey(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); }
+
+    VarChar *name = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(name) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); strncpy(buf,VARDATA(name),size); buf[size] = '\0';
+
+    int ret; char *res;
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    char *string1 = "SELECT t_val_sql FROM pg51g.alternatives WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string1) + strlen(schname) + strlen(tblname);
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string1, schname, tblname);
+    char *returned = return_val(sql); char *string2;
+
+    if ( abs(strcmp(returned,"")) ) {
+         string2 = "UPDATE pg51g.alternatives SET t_key_sql = NULL WHERE t_schema = '%s' AND t_table = '%s';";
+         int update_s = strlen(string2) + strlen(schname) + strlen(tblname) - 4;
+         char *update = (char *) palloc (update_s + 1);
+         sprintf(update, string2, schname, tblname);
+         char *ret = return_val(update); res = "UPDATED";
+    }
+    else {
+         string2 = "DELETE FROM pg51g.alternatives WHERE t_schema = '%s' AND t_table = '%s';";
+         int delete_s = strlen(string2) + strlen(schname) + strlen(tblname) - 4;
+         char *delete = (char *) palloc (delete_s + 1);
+         sprintf(delete, string2, schname, tblname);
+         char *ret = return_val(delete); res = "DELETED";
+    }
+
+    int res_s = strlen(res);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+<<sql:pg51g_undef_pkey>>=
+CREATE OR REPLACE FUNCTION pg51g.unkey(varchar) RETURNS VARCHAR AS 'pg51g.so', 'undef_pkey' LANGUAGE 'C';
+
+<<pg51g_undef_val>>=
+PG_FUNCTION_INFO_V1(undef_val);
+Datum undef_val(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); }
+
+    VarChar *name = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(name) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); strncpy(buf,VARDATA(name),size); buf[size] = '\0';
+
+    int ret; char *res;
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    char *string1 = "SELECT t_key_sql FROM pg51g.alternatives WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string1) + strlen(schname) + strlen(tblname);
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string1, schname, tblname);
+    char *returned = return_val(sql); char *string2;
+
+    if ( abs(strcmp(returned,"")) ) {
+         string2 = "UPDATE pg51g.alternatives SET t_val_sql = NULL WHERE t_schema = '%s' AND t_table = '%s';";
+         int update_s = strlen(string2) + strlen(schname) + strlen(tblname) - 4;
+         char *update = (char *) palloc (update_s + 1);
+         sprintf(update, string2, schname, tblname);
+         char *ret = return_val(update); res = "UPDATED";
+    }
+    else {
+         string2 = "DELETE FROM pg51g.alternatives WHERE t_schema = '%s' AND t_table = '%s';";
+         int delete_s = strlen(string2) + strlen(schname) + strlen(tblname) - 4;
+         char *delete = (char *) palloc (delete_s + 1);
+         sprintf(delete, string2, schname, tblname);
+         char *ret = return_val(delete); res = "DELETED";
+    }
+
+    int res_s = strlen(res);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+<<sql:pg51g_undef_val>>=
+CREATE OR REPLACE FUNCTION pg51g.unval(varchar) RETURNS VARCHAR AS 'pg51g.so', 'undef_val' LANGUAGE 'C';
+
+@ pg51g.update_higher_levels is needed as part of a trigger-based signature update policy -- it only affects pg51g records of level 1 and higher
+  In addition to schema, table, it needs an extra argument corresponding to the md5 of the primary key of the changed row. It then recalculates
+  all relevant summaries in the higher levels (changes one additional record per level).
+
+@ Note: update_higher_levels() is now deprecated -- could even be broken -- it's still here for debugging purposes.
+
+<<pg51g_update_higher_levels>>=
+PG_FUNCTION_INFO_V1(update_higher_levels);
+Datum update_higher_levels(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); } if (PG_ARGISNULL(1)) { PG_RETURN_NULL(); } 
+    VarChar *tbl = PG_GETARG_VARCHAR_P(0); unsigned int tbllen = VARSIZE(tbl) - VARHDRSZ;
+    // Getting the md5(key) value, checking for validity, storing in native string
+    VarChar *key = PG_GETARG_VARCHAR_P(1); unsigned int keylen = VARSIZE(key) - VARHDRSZ; int i;
+    if (keylen == 32) { for(i=0; i<32; i++) { if(!isxdigit(VARDATA(key)[i])) { PG_RETURN_NULL(); } } } else { PG_RETURN_NULL(); }
+    char *value = (char *) palloc(keylen+1); strncpy(value, &VARDATA(key)[0], keylen); value[keylen] = '\0';
+    // Copying argument 1 VARCHAR ('schema.table') into native string and populating *table, *schema
+    char *name = (char *) palloc(tbllen+1); strncpy(name, &VARDATA(tbl)[0], tbllen); name[tbllen] = '\0';
+    char *table = get_table(name); int tbl_s = strlen(table); if (!tbl_s) { PG_RETURN_NULL(); }
+    char *schema = get_schema(name); int sch_s = strlen(schema); if (!sch_s) { PG_RETURN_NULL(); }
+    // Getting the record count for this table *** in the future we might just read this from a settings table ***
+    int sql_s = 32 + strlen(name); char *sql = (char *) palloc (sql_s); memset(sql, 0, sql_s);
+    strcat(sql, "SELECT COUNT(*) FROM "); strcat(sql, name); strcat(sql, ";");
+    char *count = return_val(sql); int rows = 0; sscanf(count,"%d",&rows);
+    // Getting folding depth for this record count
+    int depth = get_depth(rows);
+
+    // signatures table, this could later become a call to a function
+    int sigtbl_s = tbl_s+sch_s+1; char *sigtbl = (char *) palloc (sigtbl_s + 1);
+    memset(sigtbl,0,sigtbl_s+1); strcat(sigtbl, schema); strcat(sigtbl, "_"); strcat(sigtbl, table); sigtbl[sigtbl_s] = '\0';
+
+    // we start updating the right groups, one level at a time
+    char *mask, *string, *pri;
+    for(i=1; i<=depth; i++) {
+        mask = get_mask(depth,i);
+        string = palloc(2048); memset(string, 0, 2048);
+        pri = get_group(mask,value);
+        sprintf(string, "UPDATE pg51g.%s SET key = nova.newkey, val = nova.newval FROM ( SELECT pg51g.xor_md5(key) AS newkey, pg51g.xor_md5(val) AS newval FROM pg51g.%s WHERE level = %d AND '%s' = pg51g.group_md5('%s',key) ) AS nova WHERE level = %d AND pri = '%s';", sigtbl, sigtbl, i-1, pri, mask, i, pri);
+        return_val(string);
+        pfree(mask); pfree(string); pfree(pri);
+    }
+    PG_RETURN_INT32(--i); // returning the highest level processed
+}
+
+<<sql:pg51g_update_higher_levels>>=
+CREATE OR REPLACE FUNCTION pg51g.update_higher_levels(VARCHAR, VARCHAR) RETURNS INT AS 'pg51g.so', 'update_higher_levels' LANGUAGE 'C';
+
+<<pg51g_dummy_trigger>>=
+PG_FUNCTION_INFO_V1(dummy_trigger);
+Datum dummy_trigger(PG_FUNCTION_ARGS)
+{
+    TriggerData *trigdata = (TriggerData *) fcinfo->context;
+    TupleDesc tupdesc;
+    HeapTuple rettuple;
+    bool checknull = false;
+    bool isnull;
+    int ret, i;
+    char *mysql;
+
+    /* make sure it's called as a trigger at all */
+    if (!CALLED_AS_TRIGGER(fcinfo)) elog (ERROR, "pg51g.dummy_trigger(): not called by trigger manager");
+    
+    /* tuple to return to executor */
+    if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event)) rettuple = trigdata->tg_newtuple;
+    else rettuple = trigdata->tg_trigtuple;
+
+    /* this trigger is supposed to operate after the insertion/update/deletion, not before */
+    if (TRIGGER_FIRED_BEFORE(trigdata->tg_event)) { rettuple = NULL; return PointerGetDatum(rettuple); }
+
+    tupdesc = trigdata->tg_relation->rd_att;
+
+    char *tblname = SPI_getrelname(trigdata->tg_relation);
+    char *schname = SPI_getnspname(trigdata->tg_relation);
+
+    return PointerGetDatum(rettuple);
+}
+
+<<sql:pg51g_dummy_trigger>>=
+CREATE OR REPLACE FUNCTION pg51g.dummy() RETURNS trigger AS 'pg51g.so', 'dummy_trigger' LANGUAGE 'C';
+
+<<pg51g_freeze_trigger>>=
+PG_FUNCTION_INFO_V1(freeze_trigger);
+Datum freeze_trigger(PG_FUNCTION_ARGS)
+{
+    TriggerData *trigdata = (TriggerData *) fcinfo->context;
+    TupleDesc tupdesc;
+    HeapTuple rettuple;
+
+    char *tblname = SPI_getrelname(trigdata->tg_relation);
+    char *schname = SPI_getnspname(trigdata->tg_relation);
+
+    /* make sure it's called as a trigger at all */
+    if (!CALLED_AS_TRIGGER(fcinfo)) elog (ERROR, "pg51g.freeze_trigger(): not called by trigger manager");
+
+    elog (ERROR, "Table %s.%s has been frozen by pg51g.freeze()", schname, tblname);
+    
+    rettuple = NULL; return PointerGetDatum(rettuple);
+}
+
+<<sql:pg51g_freeze_trigger>>=
+CREATE OR REPLACE FUNCTION pg51g.freeze() RETURNS trigger AS 'pg51g.so', 'freeze_trigger' LANGUAGE 'C';
+
+
+@ What should on_change() do? determine whether it's called for an insertion/deletion/update, shadow it and call higher_levels_for
+
+<<pg51g_on_change>>=
+PG_FUNCTION_INFO_V1(on_change);
+Datum on_change(PG_FUNCTION_ARGS)
+{
+    TriggerData *trigdata = (TriggerData *) fcinfo->context;
+    TupleDesc tupdesc;
+    HeapTuple rettuple;
+    bool checknull = false;
+    bool isnull;
+    int ret, i;
+    char *mysql;
+
+    /* make sure it's called as a trigger at all */
+    if (!CALLED_AS_TRIGGER(fcinfo)) elog (ERROR, "pg51g.on_change(): not called by trigger manager");
+    
+    /* tuple to return to executor */
+    if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event)) rettuple = trigdata->tg_newtuple;
+    else rettuple = trigdata->tg_trigtuple;
+
+    /* this trigger is supposed to operate after the insertion/update/deletion, not before */
+    if (TRIGGER_FIRED_BEFORE(trigdata->tg_event)) { rettuple = NULL; return PointerGetDatum(rettuple); }
+
+    tupdesc = trigdata->tg_relation->rd_att;
+
+    char *tblname = SPI_getrelname(trigdata->tg_relation);
+    char *schname = SPI_getnspname(trigdata->tg_relation);
+
+    // *target holds full name: schema.table, *sigtbl holds signature table: pg51g.schema_table
+    char *target = (char *) palloc( strlen(schname) + strlen(tblname) + 2 );
+    sprintf(target, "%s.%s", schname, tblname);
+    char *sigtbl = get_sig_target(schname, tblname);
+   
+    char *key = read_pkey_pure(schname, tblname);
+    char *val = read_val_sql(schname, tblname);
+ 
+    // we need to support complex (alternative) pkey definitions, hence eval_pri_from_tuple()
+    char *mypri = super_eval_pri_from_tuple(rettuple, tupdesc, key);
+
+	// trying to do something similar for the val checksum, to avoid table scans / increase perf
+    char *myval = super_eval_val_from_tuple(rettuple, tupdesc, val);
+
+    // just in case we are using a text field as a primary or pseudo-primary key
+    char *pri = escape_backslashes(escape_quotes(mypri));
+
+    // we are going to use a Direct Function Call to the md5_text Postgresql function to get newkey
+
+    text *rawstr_text; rawstr_text = DatumGetTextP(DirectFunctionCall1(textin, CStringGetDatum(mypri)));
+    text *mytext = DatumGetTextP( DirectFunctionCall1( md5_text, PointerGetDatum(rawstr_text) ) );
+    unsigned int mytextlen = VARSIZE(mytext) - VARHDRSZ;
+    char *newkey = (char *) palloc(mytextlen+1); strncpy(newkey, &VARDATA(mytext)[0], mytextlen); newkey[mytextlen] = '\0';
+
+    text *rawstr_val; rawstr_val = DatumGetTextP(DirectFunctionCall1(textin, CStringGetDatum(myval)));
+    text *myvaltext = DatumGetTextP( DirectFunctionCall1( md5_text, PointerGetDatum(rawstr_val) ) );
+    unsigned int myvallen = VARSIZE(myvaltext) - VARHDRSZ;
+    char *newval = (char *) palloc(myvallen+1); strncpy(newval, &VARDATA(myvaltext)[0], myvallen); newval[myvallen] = '\0';
+
+    // once we start using a metadata table for record counts, we should probably increment/decrement the counters here
+    if (!TRIGGER_FIRED_BY_DELETE(trigdata->tg_event)) {
+
+        if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event)) {
+            // *key hold the name of the target table's primary key, *val describes the concatenation of fields for the val calculation
+            mysql = palloc ( 256 + strlen(sigtbl) + 3*strlen(key) + strlen(val) + 3*strlen(pri) + 2*strlen(target) );
+            sprintf(mysql, "INSERT INTO %s (level, pri, key, val) VALUES ( 0, '%s', '%s', '%s' );", sigtbl, pri, newkey, newval);
+            on_change_exec(mysql); pfree(mysql);
+            increment_count(schname, tblname);
+        } else {
+            // *key holds the name of the target table's primary key, *val describes the concatenation of fields for the val calculation
+            mysql = palloc ( 256 + strlen(target) + strlen(key) + strlen(val) );
+            sprintf(mysql, "UPDATE %s SET key = '%s', val = '%s' WHERE level = 0 AND pri = '%s';", sigtbl, newkey, newval, pri);
+            on_change_exec(mysql); pfree(mysql);
+       }
+   } else {
+        mysql = palloc ( 256 + strlen(target) );
+        sprintf(mysql, "DELETE FROM %s WHERE level = 0 AND pri = '%s';", sigtbl, pri);
+        on_change_exec(mysql); pfree(mysql);
+        decrement_count(schname, tblname);
+    }
+
+    // Getting folding depth for this record count -- from pg51g.metadata
+    int depth = read_depth(target);
+    
+	if (depth > 0) {
+        higher_levels_for(sigtbl, target, depth, newkey);
+        stamp_metadata(schname, tblname);
+	}
+
+    return PointerGetDatum(rettuple);
+}
+
+// if (!RelationGetForm(resultRelation)->relhasindex)
+
+<<sql:pg51g_on_change>>=
+CREATE OR REPLACE FUNCTION pg51g.on_change() RETURNS trigger AS 'pg51g.so', 'on_change' LANGUAGE 'C';
+
+<<pg51g_internal_functions>>=
+/*
+  helper function which takes a SQL statement as its only argument and returns the first field of the first tuple from
+  the results as a varchar (length of string should stay <= 8192) -- what is max length for a varchar in Postgresql?
+*/
+
+/* this function retrieves the first field of the first tuple returned by a supplied SQL statement */
+
+static char * return_val(char *sql)
+{
+    char *buf = (char *) palloc (8192); int ret; int proc;
+    /* trying to connect */
+    if ((ret = SPI_connect()) < 0) { ereport(ERROR,
+                                                   ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                                     errmsg("[pg51g] return_val: connection error"),
+                                                     errhint("pg51g_return_val could not SPI connect!")  )
+                                     );
+    }
+
+    /* trying to execute sql */
+    ret = SPI_exec(sql,0);
+    if (ret < 0) { ereport(ERROR,
+                                  ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                    errmsg("[pg51g] return_val: sql error"),
+                                    errhint("Please be careful about the SQL you throw at pg51g_return_val!")  )
+                          );
+    }
+
+    proc = SPI_processed;
+    if (SPI_tuptable != NULL && proc > 0)
+    {
+        TupleDesc tupdesc = SPI_tuptable->tupdesc;
+        SPITupleTable *tuptable = SPI_tuptable;
+        HeapTuple tuple = tuptable->vals[0]; // we only need the first field of the first tuple
+        if (!(tuple == 0)) {
+            char *mystring = SPI_getvalue(tuple, tupdesc, 1);
+            if (!(mystring == 0)) { strcpy(buf, mystring); } else { strcpy(buf, ""); }
+        }
+    }
+    else { strcpy(buf, ""); } // should this be something else? this way we are confusing empty strings with no rows
+    SPI_finish();
+
+    int buf_s = strlen(buf); char *res = (char *) palloc (buf_s+1);
+    strncpy(res, buf, buf_s); res[buf_s] = '\0'; pfree(buf);
+    return res;
+}
+
+/* this is similar to return_val(), but we don't need to read any results,
+   as an error will be raised if there is anything wrong with the SQL statement;
+   we are also targeting exactly one row in the sigtbl, so we can do SPI_exec(sql,1)
+*/
+static int on_change_exec(char *sql)
+{
+    int ret;
+    /* trying to connect */
+    if ((ret = SPI_connect()) < 0) { ereport(ERROR,
+                                                   ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                                     errmsg("[pg51g] on_change_exec: connection error"),
+                                                     errhint("pg51g_on_change_exec could not SPI connect!")  )
+                                     );
+    }
+
+    /* trying to execute sql */
+    ret = SPI_exec(sql,1);
+    if (ret < 0) { ereport(ERROR,
+                                  ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                    errmsg("[pg51g] on_change_exec: sql error"),
+                                    errhint("Please be careful about the SQL you throw at pg51g_on_change_exec!")  )
+                          );
+    }
+    SPI_finish();
+    return ret;
+}
+
+static char * concat_fields(char *sql)
+{
+    char *buf = (char *) palloc (8192); int ret; int proc; int i;
+    strcpy(buf, ""); char *mystring;
+
+    /* trying to connect */
+    if ((ret = SPI_connect()) < 0) { ereport(ERROR,
+                                                   ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                                     errmsg("[pg51g] concat_fields: connection error"),
+                                                     errhint("pg51g_concat_fields could not SPI connect!")  )
+                                     );
+    }
+
+    /* trying to execute sql */
+    ret = SPI_exec(sql,0);
+    if (ret < 0) { ereport(ERROR,
+                                  ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                    errmsg("[pg51g] concat_fields: sql error"),
+                                    errhint("Please be careful about the SQL you throw at pg51g_concat_fields!")  )
+                          );
+    }
+
+    proc = SPI_processed;
+    if (SPI_tuptable != NULL && proc > 0)
+    {
+        TupleDesc tupdesc = SPI_tuptable->tupdesc;
+        SPITupleTable *tuptable = SPI_tuptable;
+        for (i=0; i<proc; i++) {
+            HeapTuple tuple = tuptable->vals[i]; // we only need the first field of the first tuple
+            if (!(tuple == 0)) {
+                mystring = SPI_getvalue(tuple, tupdesc, 1);
+                if (!(mystring == 0)) { strcat(buf, mystring); strcat(buf, "||\'-\'||"); } else { strcat(buf, ""); }
+            }
+        }
+    }
+    else { strcpy(buf, ""); } // should this be something else? this way we are confusing empty strings with no rows
+    SPI_finish();
+
+    char *res; int buf_s;
+    if (strlen(buf) > 0) { buf_s = strlen(buf) - 7; } else { buf_s = strlen(buf); }
+    res = palloc (buf_s+1); strncpy(res, buf, buf_s);
+    res[buf_s] = '\0'; pfree(sql); pfree(buf);
+    return res;
+}
+
+/* this function simply checks the existence of an entry for a { schema, table } combination in the metadata table */
+
+static bool table_in_metadata(char * schema, char * table)
+{
+   int sch_s = strlen(schema); int tbl_s = strlen(table);
+   int sql_s = 80 + sch_s + tbl_s; char *sql = (char *) palloc (sql_s); memset(sql, 0, sql_s);
+   sprintf(sql, "SELECT COUNT(*) FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';", schema, table);
+   char *val = return_val(sql); int res;
+   sscanf(val,"%d",&res);
+   if (res > 0) { return true; } else { return false; }
+}
+
+/* this function simply checks to see if a { schema, table } correpsonds to a view */
+
+static bool table_is_view(char * schema, char * table)
+{
+   int sch_s = strlen(schema); int tbl_s = strlen(table);
+   int sql_s = 94 + sch_s + tbl_s; char *sql = (char *) palloc (sql_s); memset(sql, 0, sql_s);
+   sprintf(sql, "SELECT COUNT(*) FROM information_schema.views WHERE table_schema = lower('%s') AND table_name = lower('%s');", schema, table);
+   char *val = return_val(sql); int rows = 0; sscanf(val,"%d",&rows);
+   if ( rows > 0 ) { return true; }
+   else { return false; }
+}
+
+/* this function simply checks to see if the relation is a temporary one */
+
+static bool table_is_temp(char * table)
+{
+   int tbl_s = strlen(table); int sql_s = 111 + tbl_s; char *sql = (char *) palloc (sql_s + 1);
+   sprintf(sql, "SELECT table_type FROM information_schema.tables WHERE table_schema = 'pg_temp_1' AND table_name = lower('%s');", table);
+   char *val = return_val(sql);
+   if ( abs(strcmp(val,"LOCAL TEMPORARY")) ) { pfree(sql); pfree(val); return false; }
+   else { pfree(sql); pfree(val); return true; }
+}
+
+/* this function simply checks if a table exists */
+
+static bool table_exists(char * schema, char * table)
+{
+   int sch_s = strlen(schema); int tbl_s = strlen(table);
+   int sql_s = 114 + sch_s + tbl_s; char *sql = (char *) palloc (sql_s);
+   sprintf(sql, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = lower('%s') AND table_name = lower('%s');", schema, table);
+   char *val = return_val(sql); int res; sscanf(val,"%d",&res);
+   if (res > 0) { return true; }
+   else { return false; }
+}
+
+/* this function simply checks if a table exists and then it tries to drop it */
+
+static bool drop_if_exists(char * schema, char * table)
+{
+   int sch_s = strlen(schema); int tbl_s = strlen(table);
+   int sql_s = 114 + sch_s + tbl_s; char *sql = (char *) palloc (sql_s);
+   sprintf(sql, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = lower('%s') AND table_name = lower('%s');", schema, table);
+   char *val = return_val(sql); int res; sscanf(val,"%d",&res); char *string = "DROP %s%s.%s;"; char *type, *dsql, *result;
+   if (res > 0) { 
+       if( table_is_view(schema, table) ) { type = "VIEW "; } else { type = "TABLE "; }
+       dsql = palloc( strlen(string) + strlen(type) + strlen(schema) + strlen(table) - 5 );
+       sprintf(dsql, string, type, schema, table);
+       result = return_val(dsql);
+       return true;
+   }
+   else { return false; }
+}
+
+/* this function simply checks whether sigtbl persists from a value in pg51g.metadata */
+
+static bool table_persists(char * schema, char * table)
+{
+   char *string = "SELECT t_persists FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';";
+   int sql_s = strlen(string) + strlen(schema) + strlen(table); char *sql = (char *) palloc (sql_s + 1);
+   sprintf(sql, string, schema, table);
+   char *val = return_val(sql); bool result = false; 
+   if ( abs(strcmp(val,"t")) ) { result = false; } else { result = true; }
+   return result;
+}
+
+/* this function simply returns the signature table as defined in pg51g.metadata */
+
+static char * read_sig_table(char * schema, char * table)
+{
+   char *string = "SELECT s_table FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';";
+   int sql_s = strlen(string) + strlen(schema) + strlen(table); char *sql = (char *) palloc (sql_s + 1);
+   sprintf(sql, string, schema, table);
+   char *val = return_val(sql);
+   return val;
+}
+
+/* this function simply returns the definition of a view or table from the metadata table */
+
+static char * read_table_def(char * schema, char * table)
+{
+   int sch_s = strlen(schema); int tbl_s = strlen(table);
+   int sql_s = 77 + sch_s + tbl_s; char *sql = (char *) palloc (sql_s + 1);
+   sprintf(sql, "SELECT t_definition FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';", schema, table);
+   return return_val(sql);
+}
+
+/* this function attempts to properly escape backslashes in SQL statements */
+
+static char * escape_backslashes(char * sometext)
+{
+    unsigned int size = strlen(sometext); int d_s = 11 * strlen(sometext);
+    char *newtxt = (char *) palloc (d_s + 1); int i; strcpy(newtxt,"");
+    char *tempo = (char *) palloc (2 * sizeof(char));
+    for(i=0; i<size; i++) {
+        if (sometext[i] == '\\') {
+             strcat(newtxt, "\'||E");
+             strcat(newtxt, "\'");
+             strcat(newtxt, "\\\\");
+             strcat(newtxt, "\'||");
+             strcat(newtxt, "\'");
+        }
+        else {
+            strncpy(tempo, &sometext[i], 1); tempo[1] = '\0';
+            strcat(newtxt, tempo);
+        }
+    }
+    pfree(tempo);
+    return newtxt;
+}
+
+/* this function simply duplicates all single quotes in order to escape them for the construction of SQL statements */
+
+static char * escape_quotes(char * sometext)
+{
+    unsigned int size = strlen(sometext); int d_s = 2 * strlen(sometext);
+    char *newtxt = (char *) palloc (d_s + 1); int k = 0; int i;
+    for(i=0; i<size; i++) {strncpy(&newtxt[k++], &sometext[i], 1); if (sometext[i] == '\'') {strncpy(&newtxt[k++], &sometext[i], 1);}}
+    newtxt[k] = '\0';
+    return newtxt;
+}
+
+/* this function simply extracts the name of an attribute from a COALESCE statement -- assuming it is surrounded by double quotes */
+
+static char * extract_from_double_quotes(char * sometext)
+{
+    unsigned int size = strlen(sometext); int d_s = size;
+    char *newtxt = (char *) palloc (d_s + 1); int k = 0; int i;
+	bool active = false;
+    for(i=0; i<size; i++) {
+		if (!active) { if (sometext[i] == '\"') { active = true; } else { continue; } }
+		else {
+			if (sometext[i] == '\"') { break; }
+			else { strncpy(&newtxt[k++], &sometext[i], 1); }
+		}
+	}
+    newtxt[k] = '\0';
+    return newtxt;
+}
+
+/* this function simply removes all single quotes from a SQL statement */
+
+static char * strip_quotes(char * sometext)
+{
+    unsigned int size = strlen(sometext); int d_s = strlen(sometext);
+    char *newtxt = (char *) palloc (d_s + 1); int k = 0; int i;
+    for(i=0; i<size; i++) { if (sometext[i] != '\'') {strncpy(&newtxt[k++], &sometext[i], 1);}}
+    newtxt[k] = '\0';
+    return newtxt;
+}
+
+/* this function looks for a primary key constraint for the target table in the information_schema tables */
+
+static char * find_pkey(char * schema, char * table)
+{
+   int sch_s = strlen(schema); int tbl_s = strlen(table);
+   char *string1 = "SELECT constraint_name FROM information_schema.table_constraints WHERE constraint_type = 'PRIMARY KEY' AND table_schema = lower('') AND table_name = lower('');";
+   int sql_s = strlen(string1) + sch_s + tbl_s; char *sql = (char *) palloc (sql_s + 1); memset(sql, 0, sql_s + 1);
+
+   strcpy(sql, "SELECT constraint_name FROM information_schema.table_constraints WHERE constraint_type = 'PRIMARY KEY' AND table_schema = lower('");
+   strcat(sql, schema); strcat(sql, "') AND table_name = lower('"); strcat(sql, table); strcat(sql, "');"); sql[sql_s] = '\0';
+
+   char *val = return_val(sql); pfree(sql); char *orig, *string2, *col; int col_s; int val_len = strlen(val);
+   if (val_len > 1) {
+       string2 = "SELECT column_name FROM information_schema.key_column_usage WHERE table_schema = lower('') AND table_name = lower('') AND constraint_name = '' ORDER BY ordinal_position;";
+       col_s = strlen(string2) + sch_s + tbl_s + val_len; char *col = (char *) palloc (col_s + 1); memset(col, 0, col_s + 1);
+       strcpy(col, "SELECT column_name FROM information_schema.key_column_usage WHERE table_schema = lower('"); strcat(col, schema);
+       strcat(col, "') AND table_name = lower('"); strcat(col, table); strcat(col, "') AND constraint_name = '"); strcat(col, val); strcat(col, "' ");
+       strcat(col, "ORDER BY ordinal_position;");
+       col[col_s] = '\0';
+       orig = concat_fields(col); // instead of return_val, we want to support multi-attribute primary keys
+       return orig;
+   }
+   else { 
+       orig = palloc (1); strcpy(orig, ""); return orig;
+   }
+}
+
+/* this function generates SQL text for the concatenation of all fields for each row of a particular table, using information_schema data */
+
+static char * gen_val(char * schema, char * table)
+{
+    int sch_s = strlen(schema); int tbl_s = strlen(table);
+    char *string1 = "SELECT column_name FROM information_schema.columns WHERE table_schema = lower('%s') AND table_name = lower('%s') ORDER BY ordinal_position;";
+    int sql_s = strlen(string1) + sch_s + tbl_s - 4;
+    char *sql = (char *) palloc (sql_s + 1); memset(sql, 0, sql_s + 1);
+    sprintf(sql, string1, schema, table); sql[sql_s] = '\0';
+    char *buf = (char *) palloc (8192); int ret, proc, i; strcpy(buf, "");
+
+    /* trying to connect */
+    if ((ret = SPI_connect()) < 0) { ereport(ERROR,
+                                                   ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                                     errmsg("[pg51g] gen_val: connection error"),
+                                                     errhint("pg51g_return_val could not SPI connect!")  )
+                                     );
+    }
+
+    /* trying to execute sql */
+    ret = SPI_exec(sql,0);
+    if (ret < 0) { ereport(ERROR,
+                                  ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                    errmsg("[pg51g] gen_val: sql error"),
+                                    errhint("Please be careful about the SQL you throw at pg51g_gen_val!")  )
+                          );
+    }
+
+    proc = SPI_processed;
+    if (SPI_tuptable != NULL && proc > 0)
+    {
+        TupleDesc tupdesc = SPI_tuptable->tupdesc;
+        SPITupleTable *tuptable = SPI_tuptable;
+        for (i=0; i<proc; i++) {
+            HeapTuple tuple = tuptable->vals[i];
+            if (!(tuple == 0)) {
+                char *mystring = SPI_getvalue(tuple, tupdesc, 1);
+                if (!(mystring == 0)) { strcat(buf, "COALESCE(\""); strcat(buf, mystring); strcat(buf, "\"::TEXT,'#--NULL--#')||"); }
+                else { strcat(buf, ""); }
+            }
+        }
+    }
+    else { strcat(buf, ""); }
+    SPI_finish();
+
+    char *res; int buf_s;
+    if (strlen(buf) > 0) { buf_s = strlen(buf) - 2; } else { buf_s = strlen(buf); }
+    res = palloc (buf_s+1); strncpy(res, buf, buf_s);
+    res[buf_s] = '\0'; pfree(sql); pfree(buf);
+    return res;
+}
+
+/* this function looks for the presence of a pkey definition in the pg51g.alternatives table to return
+   if there is no such thing defined in the alternatives table, it calls find_pkey() and returns its result */
+
+static char * pkey_text(char * schema, char * table)
+{
+   int sch_s = strlen(schema); int tbl_s = strlen(table);
+
+   char *string1 = "SELECT t_key_sql FROM pg51g.alternatives WHERE t_schema = '' AND t_table = '';";
+
+   int sql_s = strlen(string1) + sch_s + tbl_s; char *sql = (char *) palloc (sql_s + 1); memset(sql, 0, sql_s + 1);
+   strcpy(sql, "SELECT t_key_sql FROM pg51g.alternatives WHERE t_schema = '"); strcat(sql, schema);
+   strcat(sql, "' AND t_table = '"); strcat(sql, table); strcat(sql, "';"); sql[sql_s] = '\0';
+
+   char *val = return_val(sql); pfree(sql); char *res, *orig; int res_s; int val_len = strlen(val);
+   if ( val_len > 1 ) {
+      res_s = strlen(val) + 6; res = palloc( res_s + 1 ); memset(res, 0, res_s + 1);
+      strcpy(res, val); strcat(res, "::TEXT"); res[res_s] = '\0';
+      return res;
+   }
+   else {
+      orig = find_pkey(schema, table);
+      if (strlen(orig) > 0) {
+          res_s = strlen(orig) + 6; res = palloc( res_s + 1 ); memset(res, 0, res_s + 1);
+          strcpy(res, orig); strcat(res, "::TEXT"); res[res_s] = '\0';
+          return res;
+      } else { return orig; } // if it's an empty string we don't append '::TEXT' at the end
+   }
+}
+
+/* this function looks for the presence of a pkey definition in the pg51g.alternatives table to return
+   if there is no such thing defined in the alternatives table, it calls find_pkey() and returns its result */
+
+static char * pkey_pure(char * schema, char * table)
+{
+   int sch_s = strlen(schema); int tbl_s = strlen(table);
+
+   char *string1 = "SELECT t_key_sql FROM pg51g.alternatives WHERE t_schema = '' AND t_table = '';";
+
+   int sql_s = strlen(string1) + sch_s + tbl_s; char *sql = (char *) palloc (sql_s + 1); memset(sql, 0, sql_s + 1);
+   strcpy(sql, "SELECT t_key_sql FROM pg51g.alternatives WHERE t_schema = '"); strcat(sql, schema);
+   strcat(sql, "' AND t_table = '"); strcat(sql, table); strcat(sql, "';"); sql[sql_s] = '\0';
+
+   char *val = return_val(sql); pfree(sql); char *res, *orig; int res_s; int val_len = strlen(val);
+   if ( val_len > 1 ) { return val; }
+   else { orig = find_pkey(schema, table); return orig; }
+}
+
+/* this function looks for the presence of a pkey definition in the pg51g.alternatives table to return
+   if there is no such thing defined in the alternatives table, it calls find_pkey() and returns its result */
+
+static char * val_text(char * schema, char * table)
+{
+   int sch_s = strlen(schema); int tbl_s = strlen(table);
+
+   char *string1 = "SELECT t_val_sql FROM pg51g.alternatives WHERE t_schema = '' AND t_table = '';";
+
+   int sql_s = strlen(string1) + sch_s + tbl_s; char *sql = (char *) palloc (sql_s + 1); memset(sql, 0, sql_s + 1);
+   strcpy(sql, "SELECT t_val_sql FROM pg51g.alternatives WHERE t_schema = '"); strcat(sql, schema);
+   strcat(sql, "' AND t_table = '"); strcat(sql, table); strcat(sql, "';"); sql[sql_s] = '\0';
+
+   char *val = return_val(sql); pfree(sql); char *res, *orig; int res_s; int val_len = strlen(val);
+   if ( val_len > 1 ) { return val; }
+   else {
+      orig = gen_val(schema, table);
+      return orig;
+   }
+}
+
+static char * strip_text(char *name)
+{
+    unsigned int size = strlen(name);
+    int res = 0; int i, my_s; char *pkey; for(i=0; i<size; i++) { if (!res && name[i] == ':') { res = i; } } // finding the first colon
+    if (res) { my_s = res; pkey = palloc(size + 1); strncpy(pkey, &name[0], my_s); pkey[my_s] = '\0'; }
+    else { my_s = size; pkey = palloc(size + 1); strncpy(pkey, name, my_s); pkey[my_s] = '\0'; }
+    return pkey;
+}
+
+static char * read_pkey_pure (char * schname, char * tblname)
+{
+    char *string = "SELECT t_key_sql FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string) + strlen(schname) + strlen(tblname) - 4;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, schname, tblname);
+    char *res = return_val(sql);
+    char *pure = strip_text(res);
+    return pure;
+}
+
+static char * read_pkey_sql (char * schname, char * tblname)
+{
+    char *string = "SELECT t_key_sql FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string) + strlen(schname) + strlen(tblname) - 4;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, schname, tblname);
+    char *res = return_val(sql);
+    return res;
+}
+
+static char * read_val_sql (char * schname, char * tblname)
+{
+    char *string = "SELECT t_val_sql FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string) + strlen(schname) + strlen(tblname) - 4;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, schname, tblname);
+    char *res = return_val(sql);
+    return res;
+}
+
+/* this function attempts to produce and return a valid SQL definition for the structure of a given table */
+
+static char * table_definition(char * schema, char * table)
+{
+   int sch_s = strlen(schema); int tbl_s = strlen(table);
+   char *string = "SELECT column_name, data_type, is_nullable, column_default, is_updatable FROM information_schema.columns WHERE table_schema = lower('%s') AND table_name = lower('%s') ORDER BY ordinal_position;";
+   int sql_s = strlen(string) + sch_s + tbl_s - 4; char *sql = (char *) palloc (sql_s + 1);
+   sprintf(sql, string, schema, table);
+
+   char *def = (char *) palloc (8192);
+   bool perm = !table_is_temp(table);
+   char *temp; if ( !perm ) { temp = "TEMP "; } else { temp = ""; }
+   bool is_view = table_is_view( schema, table );
+   char *type; if (is_view) { type = "VIEW"; } else { type = "TABLE"; }
+
+   // postgresql does not allow schema specification for temporary relations
+   if (perm) { sprintf(def, "CREATE %s%s %s.%s", temp, type, schema, table); }
+   else { sprintf(def, "CREATE %s%s %s", temp, type, table); }
+
+   if( is_view ) {
+      strcat(def, " AS ");
+      char *string = "SELECT view_definition FROM information_schema.views WHERE table_schema = lower('%s') AND table_name = lower('%s');";
+      char *view_def = (char *) palloc( strlen(string) + sch_s + tbl_s - 3 );
+      sprintf(view_def, string, schema, table);
+      strcat(def, return_val(view_def));
+   }
+   else {
+      strcat(def, " (");
+      char *pkey = find_pkey(schema, table);
+      int ret, proc, i;
+
+      /* trying to connect */
+      if ((ret = SPI_connect()) < 0) { ereport(ERROR,
+                                                     ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                                       errmsg("[pg51g] table_definition: connection error"),
+                                                       errhint("pg51g_return_val could not SPI connect!")  )
+                                       );
+      }
+  
+      /* trying to execute sql */
+      ret = SPI_exec(sql,0);
+      if (ret < 0) { ereport(ERROR,
+                                    ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                      errmsg("[pg51g] table_definition: sql error"),
+                                      errhint("Please be careful about the SQL you throw at pg51g_table_definition!")  )
+                            );
+      }
+  
+      proc = SPI_processed;
+      if (SPI_tuptable != NULL && proc > 0)
+      {
+          TupleDesc tupdesc = SPI_tuptable->tupdesc;
+          SPITupleTable *tuptable = SPI_tuptable;
+          for (i=0; i<proc; i++) {
+              HeapTuple tuple = tuptable->vals[i];
+              if (!(tuple == 0)) {
+                  char *name = SPI_getvalue(tuple, tupdesc, 1);
+                  char *type = SPI_getvalue(tuple, tupdesc, 2);
+                  char *nullable = SPI_getvalue(tuple, tupdesc, 3);
+                  char *defaultval = SPI_getvalue(tuple, tupdesc, 4);
+                  char *notnull; if ( abs(strcmp(nullable,"YES")) ) { notnull = "NOT NULL"; } else { notnull = ""; }
+                  if (!(name == 0)) { strcat(def, " "); strcat(def, name); }
+                  if (!(type == 0)) { strcat(def, " "); strcat(def, type); }
+                  if (!( abs(strcmp(name,pkey)) )) { strcat(def, " "); strcat(def, "PRIMARY KEY"); }
+                  else { if (!(notnull == 0)) { strcat(def, " "); strcat(def, notnull); } }
+                  if (!(defaultval == 0)) { strcat(def, " "); strcat(def, defaultval); }
+                  strcat(def, " ,");
+              }
+          }
+          def[strlen(def)-1] = '\0'; strcat(def, ");");
+      }
+      else { strcat(def, ""); }
+      SPI_finish();
+   }
+   return escape_quotes(def);
+}
+
+static char * get_table(char *name)
+{
+    unsigned int size = strlen(name);
+    int res = 0; int i; for(i=0; i<size; i++) { if (!res && name[i] == '.') { res = i+1; } } // finding the first dot
+    int my_s = size-res; char *tblname = (char *) palloc(size + 1); strncpy(tblname, &name[res], my_s); tblname[my_s] = '\0';
+    return tblname;
+}
+
+static char * get_schema(char *name)
+{
+    unsigned int size = strlen(name);
+    int res = 0; int i, my_s; char *schname; for(i=0; i<size; i++) { if (!res && name[i] == '.') { res = i; } } // finding the first dot
+    if (res) { my_s = res; schname = palloc(size + 1); strncpy(schname, &name[0], my_s); schname[my_s] = '\0'; }
+    else { my_s = 6; schname = palloc(size + 1); strncpy(schname, "public", my_s); schname[my_s] = '\0'; }
+    if ( table_is_temp( get_table(name) ) ) { pfree(schname); schname = palloc(10); strcpy(schname, "pg_temp_1"); }
+    return schname;
+}
+
+static char * get_sig_target(char *schname, char *tblname)
+{
+    unsigned int size = strlen(schname) + strlen(tblname) + 7;
+    char *sigtbl = (char *) palloc(size + 1);
+    sprintf(sigtbl, "pg51g.%s_%s", schname, tblname); sigtbl[size] = '\0';
+    return sigtbl;
+}
+
+static char * get_snap_target(char *schname, char *tblname)
+{
+    unsigned int size = strlen(schname) + strlen(tblname) + 13;
+    char *snaptbl = (char *) palloc(size + 1);
+    sprintf(snaptbl, "pg51g.saved_%s_%s", schname, tblname); snaptbl[size] = '\0';
+    return snaptbl;
+}
+
+static char * get_sig_table(char *schname, char *tblname)
+{
+    unsigned int size = strlen(schname) + strlen(tblname) + 1;
+    char *sigtbl = (char *) palloc(size + 1);
+    sprintf(sigtbl, "%s_%s", schname, tblname); sigtbl[size] = '\0';
+    return sigtbl;
+}
+
+static char * get_sig_schema(char *schname, char *tblname)
+{
+    char *sigsch = "pg51g";
+    return sigsch;
+}
+
+static char * get_mask(int depth, int level)
+{
+    if( level > depth ) { char *mask = (char *) palloc (2); sprintf(mask, "%d", 0); return mask; }
+    text *myhex = DatumGetTextPCopy( DirectFunctionCall1(to_hex32, Int32GetDatum( pow(1024, depth-level)-1 )));
+    unsigned int myhexlen = VARSIZE(myhex) - VARHDRSZ;
+    char *mask = (char *) palloc(myhexlen+1); strncpy(mask, &VARDATA(myhex)[0], myhexlen); mask[myhexlen] = '\0';
+    return mask;
+}
+
+static char * get_group(char *mask, char *value)
+{
+
+   /* storing the size of the bit mask string in variable masksize -- we need to align the two strings for bitwise AND */
+   unsigned int masksize = strlen(mask); int pad = 0; char *zero = (char *) palloc((1+1)*sizeof(char)); strcpy(zero, "0");
+   char *mynull = (char *) palloc((1+1)*sizeof(char)); strcpy(mynull, "X");
+
+   if (masksize > 32) { return mynull; } // masksize should never be greater than 32
+   if (masksize % 2 > 0) { pad = 1; } // we need an even number of hex digits
+
+   /* just checking if input value is a valid md5 checksum (we expect 32 hex digits) */
+   unsigned int size = strlen(value); int i;
+   if (size == 32) { for(i=0; i<32; i++) { if(!isxdigit(value[i])) { return mynull; } } } else { return mynull; }
+
+   // we convert pairs of chars --> unsigned int values (bytes)
+   unsigned int bytes1[16]; unsigned int bytes2[16]; char *temp = (char *) palloc((2+1)*sizeof(char));
+
+   int pos = 16-(masksize+pad)/2; // we fill every array element up to this particular position with zero values
+
+   for(i=0; i < pos; i++) { bytes1[i] = 0; }
+   /* the following four lines are supposed to deal with odd masksize values */
+
+   if(pad) { memset(temp,0,2); strncpy(temp, &mask[0], 1); temp[2] = '\0'; sscanf(temp,"%x",&bytes1[pos]); }
+   else { memset(temp,0,2); strncpy(temp, &mask[0], 2); temp[2] = '\0'; sscanf(temp,"%x",&bytes1[pos]); }
+
+   for(i=pos+1; i<16; i++) { memset(temp,0,2); strncpy(temp,&mask[(i-pos)*2-pad],2); temp[2] = '\0'; sscanf(temp,"%x",&bytes1[i]); }
+
+   /* on to populating bytes2 -- we don't need to worry about an odd number of hex digits here */
+   for(i=0; i < 16; i++) { memset(temp, 0, 2); strncpy(temp, &value[i*2], 2); temp[2] = '\0'; sscanf(temp,"%x",&bytes2[i]); }
+
+   pfree(mynull); pfree(zero); pfree(temp);
+
+   // this is where we apply the bit mask through an AND operation and produce the new chars
+   char *chars = (char *) palloc((32+1)*sizeof(char));
+   for(i=0; i<16; i++) { sprintf(&chars[i*2], "%02x", bytes1[i] & bytes2[i]); }
+   chars[32] = '\0';
+
+   return chars;
+}
+
+static int get_depth(int rows) { return ceil(log(rows)/log(1024)); }
+
+static int read_depth (char * target)
+{
+    char *schname = get_schema(target); char *tblname = get_table(target);
+    char *string = "SELECT s_depth FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string) + strlen(schname) + strlen(tblname) - 4;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, schname, tblname);
+    char *res = return_val(sql);
+    int depth = 0; sscanf(res,"%d",&depth);
+    return depth;
+}
+
+static bool read_is_view (char * schname, char * tblname)
+{
+    char *string = "SELECT t_view FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string) + strlen(schname) + strlen(tblname) - 4;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, schname, tblname);
+    char *res = return_val(sql);
+    if ( !abs(strcmp(res,"t")) ) { return true; } else { return false; }
+}
+
+static bool read_persists (char * schname, char * tblname)
+{
+    char *string = "SELECT t_persists FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string) + strlen(schname) + strlen(tblname) - 4;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, schname, tblname);
+    char *res = return_val(sql);
+    if ( !abs(strcmp(res,"t")) ) { return true; } else { return false; }
+}
+
+static inline int higher_levels_for(char *sigtbl, char *target, int depth, char *newkey)
+{
+    unsigned int tbllen = strlen(sigtbl); unsigned int keylen = strlen(newkey); int i; int mynull = -1;
+    // Checking for the validity of the md5(key) value
+    if (keylen == 32) { for(i=0; i<32; i++) { if(!isxdigit(newkey[i])) { return mynull; } } } else { return mynull; }
+
+    // we start updating the right groups, one level at a time
+    char *mask, *string, *pri; int temp_size;
+    for(i=1; i<=depth; i++) {
+        mask = get_mask(depth,i);
+        pri = get_group(mask,newkey);
+		temp_size = 240 + 2*strlen(sigtbl) + 3*strlen(pri) + strlen(mask);
+        string = palloc(temp_size); memset(string, 0, temp_size);
+        sprintf(string, "UPDATE %s SET key = '%s', val = nova.newval FROM ( SELECT pg51g.xor_md5(key) AS newkey, pg51g.xor_md5(val) AS newval FROM %s WHERE level = %d AND '%s' = pg51g.group_md5('%s',key) ) AS nova WHERE level = %d AND pri = '%s';", sigtbl, pri, sigtbl, i-1, pri, mask, i, pri);
+        return_val(string);
+        pfree(mask); pfree(string); pfree(pri);
+    }
+    return --i; // returning the highest level processed
+}
+
+/*
+  process_table creates a (potentially TEMPORARY) signature table (s_schema.s_table) using a custom number of folding levels
+
+  The C version of process_table is not meant to be called directly. (the add_table() method will call it)
+  Besides t_schema, t_table as arguments, it should also require s_schema, s_table, so that we are able to
+  keep snapshots, create temporary signature tables on the fly etc. [boolean temp argument] -- plus folding
+  depth should probably be an argument, so that we are able to cope with folding level changes.
+
+  We shall also need a reg_table() function (updates metadata table), functions for a new snapshots table
+  and general lookup functions for the set reconciliation process (folding levels etc.)
+*/
+
+static char * process_table (char * t_schema, char * t_table, char * pkey, char * val, int depth, char * sigtbl, bool perm)
+{
+    // we have the name of the target table, plus the name of the signature table to be created
+    char *string1 = "CREATE %s TABLE %s AS SELECT 0 AS level, %s AS pri, md5(%s) AS key, md5(%s) AS val FROM %s.%s;";
+    char *sql, *mytemp; if (!perm) { mytemp = palloc(10); strcpy(mytemp, "TEMPORARY"); } else { mytemp = palloc(1); strcpy(mytemp, ""); }
+    int sql_s = strlen(string1)+strlen(mytemp)+strlen(t_schema)+strlen(t_table)+strlen(pkey)+strlen(pkey)+strlen(val)+strlen(sigtbl)-8;
+    sql = palloc(sql_s + 1); memset(sql, 0, sql_s + 1);
+    sprintf(sql, string1, mytemp, sigtbl, pkey, pkey, val, t_schema, t_table); int ret;
+
+    if ((ret = SPI_connect()) < 0) { ereport(ERROR,
+                                                   ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                                     errmsg("[pg51g] process_table: connection error"),
+                                                     errhint("pg51g_process_table could not SPI connect!")  )
+                                     );
+    }
+
+    ret = SPI_exec(sql,0);
+    if (ret < 0) { ereport(ERROR,
+                                  ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                    errmsg("[pg51g] process_table: sql error"),
+                                    errhint("Please be careful about the SQL you throw at pg51g_process_table!")  )
+                          );
+    }
+    int rows = SPI_processed; // int depth = get_depth(rows);
+
+    char *string2 = "SELECT %d AS level, pg51g.group_md5('%s', key) AS mypri, pg51g.group_md5('%s', key) AS mykey, pg51g.xor_md5(val) AS myval FROM %s WHERE level = %d GROUP BY pg51g.group_md5('%s', key);";
+    char *string3 = "INSERT INTO ";
+    char *string4 = " VALUES (%s, '%s', '%s', '%s');";
+    char *tblname = get_table(sigtbl);
+    char *string5 = "CREATE INDEX pg51g_%s_level_%d ON %s USING btree( pg51g.group_md5('%s', key) );";
+    char *string6 = "CREATE INDEX pg51g_%s_level_pri ON %s USING btree( level, pri );";
+    char *string7 = "CREATE INDEX pg51g_%s_level_%d_mask ON %s USING btree( level, pg51g.group_md5('%s', key) ) WHERE level = %d;";
+
+    int q_s = strlen(string2) + strlen(sigtbl) + 99;
+    int i, ins_s; char *mask, *q, *ins, *tmp, *idx;
+
+    char *res = (char *) palloc(8192); strcpy(res,"");
+    for(i=1; i<=depth; i++) {
+        mask = get_mask(depth, i);
+        q = palloc(q_s + 1);
+        sprintf(q, string2, i, mask, mask, sigtbl, i-1, mask);
+
+        ins_s = strlen(string3) + strlen(string4) + strlen(sigtbl);
+        ins = palloc(ins_s + 1);
+        strcpy(ins, string3); strcat(ins, sigtbl); strcat(ins, string4);
+
+        ret = SPI_exec(q,0);
+        if (ret < 0) { ereport(ERROR,
+                                      ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                        errmsg("[pg51g] self_fold: sql error"),
+                                        errhint("Please be careful about the SQL you throw at pg51g_self_fold!")  )
+                              );
+        }
+
+        int count = SPI_processed; int k;
+        if (SPI_tuptable != NULL && count > 0) {
+            TupleDesc tupdesc = SPI_tuptable->tupdesc;
+            SPITupleTable *tuptable = SPI_tuptable;
+            for(k=0; k<count; k++) {
+                HeapTuple tuple = tuptable->vals[k]; // we only need the first field of the first tuple
+                if (!(tuple == 0)) {
+                    char *one = SPI_getvalue(tuple, tupdesc, 1);
+                    char *two = SPI_getvalue(tuple, tupdesc, 2);
+                    char *three = SPI_getvalue(tuple, tupdesc, 3);
+                    char *four = SPI_getvalue(tuple, tupdesc, 4);
+                    char *five = palloc( strlen(ins) + strlen(one) + strlen(two) + strlen(three) + strlen(four) );
+                    sprintf(five, ins, one, two, three, four);
+                    SPI_push(); char *tmp = return_val(five); strcpy(res, tmp); SPI_pop();
+                }
+            }
+            char *six = palloc( strlen(string5) + strlen(tblname) + strlen(sigtbl) + strlen(mask) + 2 );
+            sprintf(six, string5, tblname, i, sigtbl, mask);
+            SPI_push(); char *hello = return_val(six); SPI_pop();
+            char *eight = palloc( strlen(string7) + strlen(tblname) + strlen(sigtbl) + strlen(mask) + 4 );
+            sprintf(eight, string7, tblname, i, sigtbl, mask, i-1);
+            SPI_push(); char *any = return_val(eight); SPI_pop();
+        }
+    }
+    char *seven = palloc( strlen(string6) + strlen(tblname) + strlen(sigtbl) + 2 );
+    sprintf(seven, string6, tblname, sigtbl);
+    SPI_push(); char *bye = return_val(seven); SPI_pop();
+
+    SPI_finish();
+    return res;
+}
+
+static char * reg_table (char * t_schema, char * t_table, char * t_key, char * t_val, int depth, bool persists, bool is_view) 
+{
+    // count, definition, s_schema, s_table have to be deduced by this function
+
+    // here we discover s_schema, s_table
+    char *s_schema = get_sig_schema(t_schema, t_table);
+    char *s_table = get_sig_table(t_schema, t_table);
+
+    // here we discover count
+    char *string1 = "SELECT COUNT(*) FROM %s.%s;";
+    int sql_s = strlen(string1) + strlen(t_schema) + strlen(t_table) - 4;
+    char *sql = (char *) palloc( sql_s + 1 );
+    sprintf(sql, string1, t_schema, t_table);
+    char *count = return_val(sql); int rows = 0; sscanf(count,"%d",&rows);
+
+    // here is definition
+    char *mydef = table_definition(t_schema, t_table);
+
+    // we need to find out if another row for t_schema, t_table already exists in metadata table
+    char *string2 = "SELECT COUNT(*) FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';";
+    int counting_s = strlen(string2) + strlen(t_schema) + strlen(t_table) - 4;
+    char *counting = (char *) palloc(counting_s + 1);
+    sprintf(counting, string2, t_schema, t_table);
+    char *meta = return_val(counting); int meta_rows = 0; sscanf(meta,"%d",&meta_rows);
+
+    // problem areas: length of boolean to text, length of integer to text
+    // at the moment t_persists and s_depth are static
+
+    char *mt_key = escape_quotes(t_key); char *mt_val = escape_quotes(t_val);
+    char *string3 = "INSERT INTO pg51g.metadata (t_schema, t_table, t_count, t_persists, t_view, t_definition, t_key_sql, t_val_sql, s_schema, s_table, s_depth) VALUES ('%s', '%s', %s, %s, %s, '%s', '%s', '%s', '%s', '%s', %d);";
+    int ins_s =strlen(string3)+strlen(t_schema)+strlen(t_table)+strlen(count)+strlen(mydef)+strlen(mt_key)+strlen(mt_val)+strlen(s_schema)+strlen(s_table);
+    char *ins = (char *) palloc (ins_s + 1);
+    sprintf(ins, string3, t_schema, t_table, count, (persists)?"true":"false", (is_view)?"true":"false", mydef, mt_key, mt_val, s_schema, s_table, depth);
+
+    char *res;
+    if (!(meta_rows > 0)) { res = return_val(ins); }
+    else { res = "whatever"; }
+
+    pfree(sql); pfree(counting); pfree(ins);
+
+    return count;
+}
+
+static char * unreg_table (char * t_schema, char * t_table) 
+{
+   char *string = "DELETE FROM pg51g.metadata WHERE t_schema = '%s' AND t_table = '%s';";
+   int sql_s = strlen(string) + strlen(t_schema) + strlen(t_table) - 4;
+   char *sql = (char *) palloc (sql_s + 1);
+   sprintf(sql, string, t_schema, t_table);
+   char *val = return_val(sql);
+   return val;
+}
+
+/* this function saves a copy of the signature table for future reference / diffing */
+
+static char * save_table (char * t_schema, char * t_table)
+{
+    char *sigtbl = get_sig_target(t_schema, t_table);
+    char *target = get_snap_target(t_schema, t_table);
+    char *string = "CREATE TABLE %s AS SELECT * FROM %s;";
+    int sql_s = strlen(string)+strlen(sigtbl)+strlen(target)-4;
+    char *sql = palloc(sql_s + 1);
+    sprintf(sql, string, target, sigtbl);
+    char *res = return_val(sql);
+
+    // *orig holds full name of table with real data 
+    char *orig = (char *) palloc( strlen(t_schema) + strlen(t_table) + 2 );
+    sprintf(orig, "%s.%s", t_schema, t_table);
+
+    // generating some indices
+    char *target_tbl = get_table(target);
+    int depth = read_depth(orig); int i; char *mask, *ret, *six, *seven;
+    char *string5 = "CREATE INDEX saved_pg51g_%s_level_%d ON %s USING btree( pg51g.group_md5('%s', key) );";
+    char *string6 = "CREATE INDEX saved_pg51g_%s_level_pri ON %s USING btree( level, pri );";
+
+    for(i=1; i<=depth; i++) {
+        mask = get_mask(depth, i);
+        six = palloc( strlen(string5) + strlen(target_tbl) + strlen(target) + strlen(mask) + 2 );
+        sprintf(six, string5, target_tbl, i, target, mask);
+        ret = return_val(six);
+    }
+    seven = palloc( strlen(string6) + strlen(target_tbl) + strlen(target) + 2 );
+    sprintf(seven, string6, target_tbl, target);
+    ret = return_val(seven);
+    return res;
+}
+
+static char * install_trigger (char * t_schema, char * t_table)
+{
+    char *string = "CREATE TRIGGER pg51g_%s_%s_on_change AFTER INSERT OR UPDATE OR DELETE ON %s.%s FOR EACH ROW EXECUTE PROCEDURE pg51g.on_change();";
+    int sql_s = strlen(string) + strlen(t_schema) + strlen(t_table) + strlen(t_schema) + strlen(t_table);
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, t_schema, t_table, t_schema, t_table);
+    int ret;
+
+    if ((ret = SPI_connect()) < 0) { ereport(ERROR,
+                                                   ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                                     errmsg("[pg51g] install_trigger: connection error"),
+                                                     errhint("pg51g_install_trigger could not SPI connect!")  )
+                                     );
+    }
+
+    ret = SPI_exec(sql,0);
+    if (ret < 0) { ereport(ERROR,
+                                  ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                    errmsg("[pg51g] install_trigger: sql error"),
+                                    errhint("Please be careful about the SQL you throw at pg51g_install_trigger!")  )
+                          );
+    }
+
+    SPI_finish();
+    return sql;
+}
+
+static char * remove_trigger (char * t_schema, char * t_table)
+{
+    char *string = "DROP TRIGGER pg51g_%s_%s_on_change ON %s.%s;";
+    int sql_s = strlen(string) + strlen(t_schema) + strlen(t_table) + strlen(t_schema) + strlen(t_table) - 8;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, t_schema, t_table, t_schema, t_table);
+    int ret;
+
+    if ((ret = SPI_connect()) < 0) { ereport(ERROR,
+                                                   ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                                     errmsg("[pg51g] remove_trigger: connection error"),
+                                                     errhint("pg51g_remove_trigger could not SPI connect!")  )
+                                     );
+    }
+
+    ret = SPI_exec(sql,0);
+    if (ret < 0) { ereport(ERROR,
+                                  ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                    errmsg("[pg51g] remove_trigger: sql error"),
+                                    errhint("Please be careful about the SQL you throw at pg51g_remove_trigger!")  )
+                          );
+    }
+
+    SPI_finish();
+    return sql;
+}
+
+static char * install_freeze (char * t_schema, char * t_table)
+{
+    char *string = "CREATE TRIGGER pg51g_%s_%s_freeze AFTER INSERT OR UPDATE OR DELETE ON %s.%s FOR EACH ROW EXECUTE PROCEDURE pg51g.freeze();";
+    int sql_s = strlen(string) + strlen(t_schema) + strlen(t_table) + strlen(t_schema) + strlen(t_table);
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, t_schema, t_table, t_schema, t_table);
+    int ret;
+
+    if ((ret = SPI_connect()) < 0) { ereport(ERROR,
+                                                   ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                                     errmsg("[pg51g] install_freeze: connection error"),
+                                                     errhint("pg51g_install_freeze could not SPI connect!")  )
+                                     );
+    }
+
+    ret = SPI_exec(sql,0);
+    if (ret < 0) { ereport(ERROR,
+                                  ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                    errmsg("[pg51g] install_freeze: sql error"),
+                                    errhint("Please be careful about the SQL you throw at pg51g_install_freeze!")  )
+                          );
+    }
+
+    SPI_finish();
+    return sql;
+}
+
+static char * remove_freeze (char * t_schema, char * t_table)
+{
+    char *string = "DROP TRIGGER pg51g_%s_%s_freeze ON %s.%s;";
+    int sql_s = strlen(string) + strlen(t_schema) + strlen(t_table) + strlen(t_schema) + strlen(t_table) - 8;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, t_schema, t_table, t_schema, t_table);
+    int ret;
+
+    if ((ret = SPI_connect()) < 0) { ereport(ERROR,
+                                                   ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                                     errmsg("[pg51g] remove_freeze: connection error"),
+                                                     errhint("pg51g_remove_freeze could not SPI connect!")  )
+                                     );
+    }
+
+    ret = SPI_exec(sql,0);
+    if (ret < 0) { ereport(ERROR,
+                                  ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
+                                    errmsg("[pg51g] remove_freeze: sql error"),
+                                    errhint("Please be careful about the SQL you throw at pg51g_remove_freeze!")  )
+                          );
+    }
+
+    SPI_finish();
+    return sql;
+}
+
+static char * stamp_metadata (char * t_schema, char * t_table)
+{
+    char *string = "UPDATE pg51g.metadata SET updated = now() WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string) + strlen(t_schema) + strlen(t_table) - 4;
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, t_schema, t_table);
+    char *res = return_val(sql); 
+    return res;
+}
+
+static int num_of_concats (char * arg)
+{
+    int size = strlen(arg); int i, num = 0;
+    char *temp = (char *) palloc (2 * sizeof(char) + 1);
+    for(i=0; i<size-1; i++) {
+        strncpy(temp, &arg[i], 2); temp[2] = '\0';
+        if ( !abs(strcmp(temp,"||")) ) { num++; }
+    }
+    return num;
+}
+
+static char * append_val_to_string (char * field, HeapTuple tuple, TupleDesc desc, char * string)
+{
+    int i, res; bool search = true; char *result;
+    for (i = 0; i < desc->natts; i++) {
+        if ( search && !abs(strcmp(field, NameStr(desc->attrs[i]->attname))) ) {
+            search = false; res = i;
+        }
+    }
+    if (!search) { result = SPI_getvalue(tuple, desc, res+1); } else { result = ""; }
+    char *output = (char *) palloc( strlen(string) + strlen(result) + 1 );
+    strcpy(output, string); strcat(output, result); pfree(string);
+    return output;
+}
+
+static char * eval_pri_from_tuple (HeapTuple tuple, TupleDesc desc, char * key)
+{
+    int i, res; bool search = true; char *result;
+    char *ekey = escape_quotes(key); // perhaps we want some delimiters in our concatenation
+    if ( strlen(key) != strlen(ekey) ) { return strip_quotes(key) ; }
+    for (i = 0; i < desc->natts; i++) {
+        if ( search && !abs(strcmp(key, NameStr(desc->attrs[i]->attname))) ) {
+            search = false; res = i;
+        }
+    }
+    if (!search) { result = SPI_getvalue(tuple, desc, res+1); } else { result = ""; }
+    return result;
+}
+
+static char * eval_val_from_tuple (HeapTuple tuple, TupleDesc desc, char * val)
+{
+    int i, res; bool search = true; char *result;
+    char *token = extract_from_double_quotes(val);  // we assume token is enclosed in double quotes
+													// like so: COALESCE("myserial1"::TEXT,'#--NULL--#')
+    if ( strlen(val) == strlen(token) ) { return strip_quotes(val) ; }
+    for (i = 0; i < desc->natts; i++) {
+        if ( search && !abs(strcmp(token, NameStr(desc->attrs[i]->attname))) ) {
+            search = false; res = i;
+        }
+    }
+    if (!search) { result = SPI_getvalue(tuple, desc, res+1); }
+	if (result) { return result; } else { return "#--NULL--#"; }
+}
+
+static char * super_eval_pri_from_tuple (HeapTuple tuple, TupleDesc desc, char * key)
+{
+    char *result = (char *) palloc (8192);
+    strcpy(result, "");
+
+    int size = strlen(key); int i, left, right, tsize;
+    left = 0; right = 0; tsize = 0; char *token;
+    char *temp = (char *) palloc (2 * sizeof(char) + 1);
+
+    for(i=0; i<size-1; i++) {
+        strncpy(temp, &key[i], 2); temp[2] = '\0';
+        if ( !abs(strcmp(temp,"||")) ) {
+            tsize = i - left;
+            token = palloc ( tsize * sizeof(char) + 1 );
+            strncpy(token, &key[left], tsize); token[tsize] = '\0';
+            strcat(result, eval_pri_from_tuple(tuple, desc, token));
+            pfree(token);
+            left = i + 2;
+        }
+    }
+    tsize = size - left;
+    if(tsize) {
+        token = palloc ( tsize * sizeof(char) + 1 );
+        strncpy(token, &key[left], tsize); token[tsize] = '\0';
+        strcat(result, eval_pri_from_tuple(tuple, desc, token));
+    }
+    return result;
+}
+
+static char * super_eval_val_from_tuple (HeapTuple tuple, TupleDesc desc, char * val)
+{
+    char *result = (char *) palloc (8192);
+    strcpy(result, "");
+
+    int size = strlen(val); int i, left, right, tsize;
+    left = 0; right = 0; tsize = 0; char *token;
+    char *temp = (char *) palloc (2 * sizeof(char) + 1);
+
+    for(i=0; i<size-1; i++) {
+        strncpy(temp, &val[i], 2); temp[2] = '\0';
+        if ( !abs(strcmp(temp,"||")) ) {
+            tsize = i - left;
+            token = palloc ( tsize * sizeof(char) + 1 );
+            strncpy(token, &val[left], tsize); token[tsize] = '\0';
+            strcat(result, eval_val_from_tuple(tuple, desc, token));
+            pfree(token);
+            left = i + 2;
+        }
+    }
+    tsize = size - left;
+    if(tsize) {
+        token = palloc ( tsize * sizeof(char) + 1 );
+        strncpy(token, &val[left], tsize); token[tsize] = '\0';
+        strcat(result, eval_val_from_tuple(tuple, desc, token));
+    }
+    return result;
+}
+
+static char * increment_count (char * t_schema, char * t_table)
+{
+    char *string = "UPDATE pg51g.metadata SET t_count = t_count + 1 WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string) + strlen(t_schema) + strlen(t_table);
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, t_schema, t_table);
+    char *res = return_val(sql);
+    return res;
+}
+
+static char * decrement_count (char * t_schema, char * t_table)
+{
+    char *string = "UPDATE pg51g.metadata SET t_count = t_count - 1 WHERE t_schema = '%s' AND t_table = '%s';";
+    int sql_s = strlen(string) + strlen(t_schema) + strlen(t_table);
+    char *sql = (char *) palloc (sql_s + 1);
+    sprintf(sql, string, t_schema, t_table);
+    char *res = return_val(sql);
+    return res;
+}
+
+static char * sync_saved_row( char *current_tbl, char *saved_tbl, char *op, char *key, int level )
+{
+	int somesize = strlen(current_tbl) + strlen(saved_tbl) + strlen(op) + strlen(key);
+	char *somesql = (char *) palloc ( 2*somesize * sizeof(char) ); strcpy(somesql, "");
+
+    if ( !abs(strcmp(op,"INSERT")) ) {
+		sprintf(somesql, "INSERT INTO %s SELECT * FROM %s WHERE level = %d AND pri = '%s';", saved_tbl, current_tbl, level, key);
+	}
+    if ( !abs(strcmp(op,"DELETE")) ) {
+		sprintf(somesql, "DELETE FROM %s WHERE level = %d AND pri = '%s';", saved_tbl, level, key);
+	}
+    if ( !abs(strcmp(op,"UPDATE")) ) {
+		sprintf(somesql, "UPDATE %s SET val = (SELECT val FROM %s WHERE level = %d AND pri = '%s') WHERE level = %d AND pri = '%s';", saved_tbl, current_tbl, level, key, level, key);
+	}
+    char *res = return_val(somesql);
+    pfree(somesql);
+
+	// elog(NOTICE, "[pg51g] '%s' - %s '%s' level %d", current_tbl, op, key, level );
+	return res;
+}
+
+int test_push( char *current_tbl, char *saved_tbl, char *op, char *key, int level )
+{
+	elog(NOTICE, "[pg51g] '%s' - %s '%s' level %d", current_tbl, op, key, level );
+	return 1;
+}
+
+@ Section 8: Implementation notes
+@ -----------------------------------------------------------------------------------------------
+
+@ For block folding of our records, we perform the following calculations:
+
+    tree depth -- SELECT ceil(ln(2000000)/ln(1024)); -- 2000000 is number of records, 1024 is folding factor
+    grouping mask -- SELECT to_hex((1024^(2-0)-1)::int); -- 1024 is folding factor, 2 is tree depth, 0 is level (1+)
+
+@ I have decided, actually, to use 1024 as a blocking factor, instead of 4096. The depth changes according to rows like so:
+
+Depth:	 1	Rows: 2
+Depth:	 2	Rows: 1025
+Depth:	 3	Rows: 1048577
+Depth:	 4	Rows: 1073741825
+
+@ Perhaps, it would be a good idea having an MD5 Postgresql type, nothing fancy, just a SQL-level definition that enforces some
+  restrictions on the number of chars (32), the range of chars (valid hex digits - lowercase) -- but our functions will be checking
+  these things, too. (possible to do pass-by-reference, fixed-length?)
+
+@ apparently, there is some support for defining composite types in SQL, but it doesn't feel right. I think I am going to
+  drop the idea of a formal md5 type definition in favour of a CHECK( pg51g.is_md5(column) ) constraint in the md5 shadow tables
+
+@ Trigger-based maintenance of the signature tables gets a lot faster with the right indices in place. E.g. with this index:
+    CREATE INDEX pg51g_public_sometable_level_1 ON pg51g.public_sometable USING btree( pg51g.group_md5('fffff',key) );
+
+  The time taken to re-calculate signatures summary for level 1 dropped from 13s to 0.5s. With the inclusion of another index:
+    CREATE INDEX pg51g_public_sometable_level_pri ON pg51g.public_sometable USING btree( level, pri );
+
+  This time was further reduced to the order of 50 ms -- not bad!
+
+@ Total time for 2000000 rows, 3 levels is 500 ms -- without the SELECT COUNT(*) this time drops to 50 ms
+
+@ Note: with the introduction of more and more indices, trigger delay in some cases may even reach 1 sec :-(
+
+@ Section 9: SQL schema
+@ -----------------------------------------------------------------------------------------------
+
+<<pg51g_create_schema>>=
+CREATE SCHEMA pg51g; 
+<<pg51g_create_metadata>>=
+CREATE TABLE pg51g.metadata (
+   id SERIAL NOT NULL, 
+   t_schema character varying NOT NULL, 
+   t_table character varying NOT NULL, 
+   t_count bigint NOT NULL, 
+   t_persists boolean NOT NULL, 
+   t_view boolean NOT NULL, 
+   t_definition text, 
+   t_key_sql text, 
+   t_val_sql text, 
+   s_schema character varying NOT NULL, 
+   s_table character varying NOT NULL, 
+   s_depth int NOT NULL, 
+   created timestamp without time zone DEFAULT now() NOT NULL, 
+   updated timestamp without time zone, 
+   CONSTRAINT metadata_pkey PRIMARY KEY (id)
+) WITH (OIDS=FALSE)
+;
+CREATE INDEX pg51g_metadata_idx ON pg51g.metadata USING btree( t_schema, t_table );
+
+<<pg51g_create_alternatives>>=
+CREATE TABLE pg51g.alternatives
+(
+   t_schema character varying, 
+   t_table character varying, 
+   t_key_sql text, 
+   t_val_sql text, 
+   CONSTRAINT alternatives_pkey PRIMARY KEY (t_schema, t_table)
+) WITH (OIDS=FALSE)
+;
+
+@ Section 10: PL/pgSQL Convenience Functions
+@ -----------------------------------------------------------------------------------------------
+
+<<pg51g_create_convenience>>=
+
+CREATE LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_list_tables(OUT target TEXT)
+  RETURNS SETOF text AS
+$$
+   DECLARE
+       myrec   RECORD;
+       schname TEXT;
+       tblname TEXT;
+   BEGIN
+       FOR myrec IN SELECT table_schema, table_name FROM information_schema.tables
+       WHERE table_type = 'BASE TABLE' AND table_schema NOT IN
+             ('pg_catalog','information_schema','pg51g')
+       LOOP
+          SELECT quote_ident(myrec.table_schema)||'.'||quote_ident(myrec.table_name) INTO target;
+          RETURN NEXT;
+       END LOOP;
+       RETURN;
+   END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_list_tables_with_count(OUT target TEXT, OUT rows INTEGER)
+  RETURNS SETOF record AS
+$$
+   DECLARE
+       mysql TEXT;
+   BEGIN
+       FOR target IN SELECT * FROM pg51g_list_tables()
+       LOOP
+          SELECT 'SELECT COUNT(1) FROM '||target INTO mysql;
+          EXECUTE mysql INTO STRICT rows;
+          RETURN NEXT;
+       END LOOP;
+       RETURN;
+   END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_bulk_add(OUT target TEXT, OUT result TEXT)
+  RETURNS SETOF record AS
+$$
+    BEGIN
+         FOR target IN SELECT * FROM pg51g_list_remaining()
+         LOOP
+             BEGIN
+                 SELECT pg51g.add(target) INTO result;
+                 EXCEPTION WHEN OTHERS THEN
+             END;
+             RETURN NEXT;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_bulk_del(OUT target TEXT, OUT result TEXT)
+  RETURNS SETOF record AS
+$$
+    BEGIN
+         FOR target IN SELECT t_schema||'.'||t_table FROM pg51g.metadata
+         LOOP
+             BEGIN
+                 SELECT pg51g.del(target) INTO result;
+                 EXCEPTION WHEN OTHERS THEN
+             END;
+             RETURN NEXT;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_bulk_snap(OUT target TEXT, OUT result TEXT)
+  RETURNS SETOF record AS
+$$
+    BEGIN
+         FOR target IN SELECT t_schema||'.'||t_table FROM pg51g.metadata
+         LOOP
+             BEGIN
+                 SELECT pg51g.snap(target) INTO result;
+                 EXCEPTION WHEN OTHERS THEN
+             END;
+             RETURN NEXT;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_bulk_unmonitor(OUT target TEXT, OUT result TEXT)
+  RETURNS SETOF record AS
+$$
+    BEGIN
+         FOR target IN SELECT t_schema||'.'||t_table FROM pg51g.metadata
+         LOOP
+             BEGIN
+                 SELECT pg51g.unmonitor_table(target) INTO result;
+                 EXCEPTION WHEN OTHERS THEN
+             END;
+             RETURN NEXT;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_bulk_monitor(OUT target TEXT, OUT result TEXT)
+  RETURNS SETOF record AS
+$$
+    BEGIN
+         FOR target IN SELECT t_schema||'.'||t_table FROM pg51g.metadata
+         LOOP
+             BEGIN
+                 SELECT pg51g.monitor_table(target) INTO result;
+                 EXCEPTION WHEN OTHERS THEN
+             END;
+             RETURN NEXT;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_bulk_freeze(OUT target TEXT, OUT result TEXT)
+  RETURNS SETOF record AS
+$$
+    BEGIN
+         FOR target IN SELECT t_schema||'.'||t_table FROM pg51g.metadata
+         LOOP
+             BEGIN
+                 SELECT pg51g.freeze_table(target) INTO result;
+                 EXCEPTION WHEN OTHERS THEN
+             END;
+             RETURN NEXT;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_bulk_unfreeze(OUT target TEXT, OUT result TEXT)
+  RETURNS SETOF record AS
+$$
+    BEGIN
+         FOR target IN SELECT t_schema||'.'||t_table FROM pg51g.metadata
+         LOOP
+             BEGIN
+                 SELECT pg51g.unfreeze_table(target) INTO result;
+                 EXCEPTION WHEN OTHERS THEN
+             END;
+             RETURN NEXT;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_bulk_diff(OUT target TEXT, OUT keydef TEXT, OUT key TEXT, OUT op TEXT)
+  RETURNS SETOF record AS
+$$
+   DECLARE
+       myrec   RECORD;
+    BEGIN
+         FOR target, keydef IN SELECT t_schema||'.'||t_table, t_key_sql FROM pg51g.metadata
+         LOOP
+             BEGIN
+                 FOR myrec IN SELECT (pg51g.diff(target)).* ORDER BY op
+                 LOOP
+                     SELECT quote_literal(myrec.key), quote_literal(myrec.op) INTO key, op;
+                     RETURN NEXT;
+                 END LOOP;
+                 EXCEPTION WHEN OTHERS THEN
+             END;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_list_remaining(OUT target TEXT, OUT result TEXT)
+  RETURNS SETOF record AS
+$$
+    BEGIN
+         FOR target IN SELECT mylist.* FROM (SELECT * FROM pg51g_list_tables()) AS mylist
+             LEFT JOIN pg51g.metadata AS metadata
+             ON mylist.target = metadata.t_schema||'.'||metadata.t_table
+             WHERE metadata.t_schema IS NULL AND metadata.t_table IS NULL
+         LOOP
+             BEGIN
+                 SELECT constraint_name FROM information_schema.table_constraints
+                     WHERE constraint_type = 'PRIMARY KEY'
+                     AND table_schema||'.'||table_name = lower(target) INTO result;
+                 EXCEPTION WHEN OTHERS THEN
+             END;
+             RETURN NEXT;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_auth_user(someuser TEXT)
+  RETURNS BOOLEAN AS
+$$
+    DECLARE
+         target TEXT;
+    BEGIN
+	     EXECUTE 'GRANT USAGE ON SCHEMA pg51g TO '||quote_ident(someuser);
+         EXECUTE 'GRANT SELECT, UPDATE ON pg51g.metadata TO '||quote_ident(someuser);
+         FOR target IN SELECT quote_ident(s_schema)||'.'||quote_ident(s_table) FROM pg51g.metadata
+         LOOP
+             EXECUTE 'GRANT SELECT, UPDATE, INSERT, DELETE ON '||target||' TO '||quote_ident(someuser);
+         END LOOP;
+         RETURN true;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+-- The only reason this function is here is because it is called by our sample Java code
+
+CREATE OR REPLACE FUNCTION pg51g.mask4level(int,int) RETURNS TEXT AS $$
+   SELECT to_hex((1024^($1-$2)-1)::int) AS result;
+$$ LANGUAGE 'sql';
+
+-- Essential for defer() / sync() functionality
+
+CREATE OR REPLACE FUNCTION pg51g.higher_levels(my_schema TEXT, my_table TEXT) RETURNS TEXT AS $$
+   DECLARE
+   		depth INT;
+		i INT;
+		mask TEXT;
+		sigtbl TEXT;
+   BEGIN
+		 -- getting rid of all higher level checksums
+         EXECUTE 'DELETE FROM pg51g.'||my_schema||'_'||my_table||' WHERE level > 0';
+		 -- getting the depth from the pg51g.metadata table
+		 SELECT s_depth INTO depth FROM pg51g.metadata WHERE t_schema = my_schema AND t_table = my_table;
+		 i := 1;
+		 WHILE i <= depth
+		 LOOP
+		 	-- foreach folding level, we need mask, sigtbl, group
+			SELECT pg51g.mask4level(depth, i) INTO mask;
+			SELECT 'pg51g.'||quote_ident(my_schema)||'_'||quote_ident(my_table) INTO sigtbl;
+			EXECUTE 'INSERT INTO '||sigtbl||' SELECT '||i||' AS level, pg51g.group_md5('||quote_literal(mask)||', key) AS mypri, pg51g.group_md5('||
+						quote_literal(mask)||', key) AS mykey, pg51g.xor_md5(val) AS myval FROM '||sigtbl||
+						' WHERE level = '|| (i-1) ||' GROUP BY pg51g.group_md5('||quote_literal(mask)||',key)';
+		 	i := i + 1;
+         END LOOP;
+		 EXECUTE 'UPDATE pg51g.metadata SET updated = '||quote_literal(now())||' WHERE t_schema = '||quote_literal(my_schema)||
+		 	' AND t_table = '||quote_literal(my_table);
+		 RETURN i::text;
+   END;
+$$ LANGUAGE 'plpgsql';
+
+-- Helpful for generating indices for components of multi-column primary keys, speeding up trigger
+
+CREATE OR REPLACE FUNCTION pg51g_fix_tables(OUT target TEXT)
+  RETURNS SETOF TEXT AS
+$$
+	DECLARE
+		mylist text[];
+		sql TEXT;
+		tmp RECORD;
+		idx TEXT;
+		counter INT;
+    BEGIN
+         FOR target IN SELECT mytab FROM (SELECT COUNT(column_name) AS columns, table_schema||'.'||table_name AS mytab FROM information_schema.key_column_usage GROUP BY table_schema||'.'||table_name) AS mycount WHERE columns > 1
+         LOOP
+		 	BEGIN
+		 		SELECT regexp_split_to_array(target, E'\\.') INTO mylist;
+				counter := 1;
+		 		SELECT 'SELECT column_name, table_schema, table_name FROM information_schema.key_column_usage WHERE table_schema = '
+			 				||quote_literal(mylist[array_lower(mylist,1)])|| ' AND table_name = '
+							||quote_literal(mylist[array_upper(mylist,1)])||' ORDER BY ordinal_position' INTO sql;
+		 		FOR tmp IN EXECUTE sql
+		 		LOOP
+						SELECT 'CREATE INDEX pg51g_fix_'||tmp.table_schema||'_'||tmp.table_name||'_'||counter||' ON '||quote_ident(tmp.table_schema)||'.'||
+							quote_ident(tmp.table_name)||' USING btree('||tmp.column_name||')' INTO idx;
+						EXECUTE idx;
+						counter := counter + 1;
+		 		END LOOP;
+		 		RETURN NEXT;
+            	EXCEPTION WHEN OTHERS THEN
+			END;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+-- These functions provide the pg51g.defer(), pg51g.sync() interface
+
+CREATE OR REPLACE FUNCTION pg51g_bulk_defer(OUT myschema TEXT, OUT mytable TEXT)
+  RETURNS SETOF record AS
+$$
+    BEGIN
+         FOR myschema, mytable IN SELECT t_schema, t_table FROM pg51g.metadata
+         LOOP
+             BEGIN
+				 EXECUTE 'UPDATE pg51g.metadata SET s_depth = -5 WHERE t_schema = '||quote_literal(myschema)||' AND t_table = '||quote_literal(mytable);
+             END;
+			 RETURN NEXT;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE OR REPLACE FUNCTION pg51g_bulk_sync(OUT myschema TEXT, OUT mytable TEXT)
+  RETURNS SETOF record AS
+$$
+	DECLARE
+		depth INT;
+    BEGIN
+         FOR myschema, mytable IN SELECT t_schema, t_table FROM pg51g.metadata
+         LOOP
+             BEGIN
+				 EXECUTE 'SELECT max(level) FROM pg51g.'||myschema||'_'||mytable INTO depth;
+				 IF depth IS NOT NULL THEN
+				 	EXECUTE 'UPDATE pg51g.metadata SET s_depth = '||depth||' WHERE t_schema = '||quote_literal(myschema)||' AND t_table = '||quote_literal(mytable);
+				 ELSE
+				 	EXECUTE 'UPDATE pg51g.metadata SET s_depth = -15 WHERE t_schema = '||quote_literal(myschema)||' AND t_table = '||quote_literal(mytable);
+				 END IF;
+				 EXECUTE 'SELECT pg51g.higher_levels('||quote_literal(myschema)||', '||quote_literal(mytable)||')';
+             END;
+			 RETURN NEXT;
+         END LOOP;
+         RETURN;
+    END;
+$$ LANGUAGE 'plpgsql';
+
+
+@ Section 11: PL/Perl Prototype Functions
+@ -----------------------------------------------------------------------------------------------
+
+<<pg51g_sql4_diff>>=
+
+CREATE OR REPLACE FUNCTION pg51g.sql4_diff(varchar, varchar, integer) RETURNS TEXT AS $$
+my $current = shift; my $previous = shift; my $level = shift;
+my $sql = "SELECT now(); SELECT COALESCE(l.level,r.level) AS level, CASE WHEN l.left IS NULL THEN 'delete' WHEN r.right IS NULL THEN 'insert' ELSE 'update' END AS operation, COALESCE(l.left, r.right) AS pri FROM ( SELECT COALESCE(leftlevel,rightlevel) AS level, data.left, data.right, data.leftkey, data.rightkey, data.leftval, data.rightval FROM (SELECT current.level AS leftlevel, previous.level AS rightlevel, current.pri AS left, previous.pri AS right, current.key AS leftkey, previous.key AS rightkey, current.val AS leftval, previous.val AS rightval FROM (SELECT * FROM left_table WHERE level = my_level) AS current LEFT JOIN (SELECT * FROM right_table WHERE level = my_level) AS previous ON (current.level = previous.level AND current.pri = previous.pri AND current.key = previous.key AND current.val = previous.val) ) AS data WHERE data.right IS NULL OR data.rightkey IS NULL OR data.rightval IS NULL ORDER BY level DESC ) AS l FULL OUTER JOIN ( SELECT COALESCE(leftlevel,rightlevel) AS level, data.left, data.right, data.leftkey, data.rightkey, data.leftval, data.rightval FROM (SELECT current.level AS leftlevel, previous.level AS rightlevel, current.pri AS left, previous.pri AS right, current.key AS leftkey, previous.key AS rightkey, current.val AS leftval, previous.val AS rightval FROM (SELECT * FROM left_table WHERE level = my_level) AS current RIGHT JOIN (SELECT * FROM right_table WHERE level = my_level) AS previous ON (current.level = previous.level AND current.pri = previous.pri AND current.key = previous.key AND current.val = previous.val) ) AS data WHERE data.left IS NULL OR data.leftkey IS NULL OR data.leftval IS NULL ORDER BY level DESC ) AS r ON l.left = r.right ORDER BY operation DESC; SELECT now();"; $sql =~ s/left_table/$current/g; $sql =~ s/right_table/$previous/g; $sql =~ s/my_level/$level/g;
+return $sql;
+$$ LANGUAGE 'plperl';
+
+<<pg51g_depth4table>>=
+CREATE OR REPLACE FUNCTION pg51g.depth4table(varchar,varchar) RETURNS TEXT AS $$
+   my $schema = shift; my $table = shift; my $select; my $rv;
+   $select = "SELECT COUNT(*) AS result FROM ".$schema.".".$table.";" ;
+   $rv = spi_exec_query($select, 0);
+   my $count = $rv->{rows}[0]->{result};
+   $select = "SELECT ceil(ln($count)/ln(1024)) AS result;";
+   $rv = spi_exec_query($select, 0);
+   my $depth = $rv->{rows}[0]->{result};
+   return $depth;
+$$ LANGUAGE 'plperl';
+
+CREATE OR REPLACE FUNCTION pg51g.folding_levels(varchar) RETURNS INTEGER AS $$
+   my $table = shift; my $select; my $rv;
+   $select = "SELECT COUNT(*) AS result FROM ".$table.";" ;
+   $rv = spi_exec_query($select, 0);
+   my $count = $rv->{rows}[0]->{result};
+   $select = "SELECT ceil(ln($count)/ln(1024)) AS result;";
+   $rv = spi_exec_query($select, 0);
+   my $depth = $rv->{rows}[0]->{result};
+   return $depth;
+$$ LANGUAGE 'plperl';
+
+<<pg51g_mask4level>>=
+CREATE OR REPLACE FUNCTION pg51g.mask4level(int,int) RETURNS TEXT AS $$
+   my $depth = shift; my $level = shift; my $select; my $rv;
+   $select = "SELECT to_hex((1024^($depth-$level)-1)::int) AS result;";
+   $rv = spi_exec_query($select, 0);
+   my $mask = $rv->{rows}[0]->{result};
+   return $mask;
+$$ LANGUAGE 'plperl';
+
+<<pg51g_sql4_fields2text>>=
+CREATE OR REPLACE FUNCTION pg51g.sql4_fields2text(varchar,varchar) RETURNS TEXT AS $$
+   my $schema = shift; my $table = shift;
+   my $select = "SELECT column_name, data_type, is_nullable FROM information_schema.columns ";
+   $select .= "WHERE table_schema = lower('".$schema."') AND table_name = lower('".$table."') ";
+   $select .= "ORDER BY ordinal_position;";
+   $rv = spi_exec_query($select, 0);
+   $rows = $rv->{processed}; my $i; my @names; my @types;
+   for($i=0; $i<$rows; $i++) { push @names, $rv->{rows}[$i]->{column_name}; push @types, $rv->{rows}[$i]->{data_type}; }
+   my $size = scalar(@names); my $output;
+   for($i=0; $i<$size; $i++) { $output .= "COALESCE(".$names[$i]."::TEXT,'#--NULL--#')||"; } chop $output; chop $output;
+   return $output;
+$$ LANGUAGE 'plperl';
+
+<<pg51g_sql4_pkey2text>>=
+CREATE OR REPLACE FUNCTION pg51g.sql4_pkey2text(varchar,varchar) RETURNS TEXT AS $$
+   my $schema = shift; my $table = shift;
+   my $select = "SELECT table_schema, table_name, constraint_name, constraint_type FROM information_schema.table_constraints ";
+   $select .= "WHERE constraint_type = 'PRIMARY KEY' AND table_schema = lower('".$schema."') AND table_name = lower('".$table."');";
+   $rv = spi_exec_query($select, 0);
+   $rows = $rv->{processed}; my $output; my $pkey; my $primary;
+   if($rows > 0) {
+      $pkey = $rv->{rows}[0]->{constraint_name}; # this is the name of the index, not the column
+      $select = "SELECT constraint_name, column_name, table_name, table_schema FROM information_schema.key_column_usage ";
+      $select .= "WHERE table_schema = lower('".$schema."') AND table_name = lower('".$table."') AND constraint_name = '".$pkey."';";
+      $rn = spi_exec_query($select, 0);
+      $cols = $rn->{processed}; if ($cols > 0) { $primary = $rn->{rows}[0]->{column_name}; }
+   }
+   else { return; }
+   $output = $primary."::TEXT";
+   return $output;
+$$ LANGUAGE 'plperl';
+
+<<pg51g_sql4_pkey>>=
+CREATE OR REPLACE FUNCTION pg51g.sql4_pkey(varchar,varchar) RETURNS TEXT AS $$
+   my $schema = shift; my $table = shift;
+   my $select = "SELECT table_schema, table_name, constraint_name, constraint_type FROM information_schema.table_constraints ";
+   $select .= "WHERE constraint_type = 'PRIMARY KEY' AND table_schema = lower('".$schema."') AND table_name = lower('".$table."');";
+   $rv = spi_exec_query($select, 0);
+   $rows = $rv->{processed}; my $output; my $pkey; my $primary;
+   if($rows > 0) {
+      $pkey = $rv->{rows}[0]->{constraint_name}; # this is the name of the index, not the column
+      $select = "SELECT constraint_name, column_name, table_name, table_schema FROM information_schema.key_column_usage ";
+      $select .= "WHERE table_schema = lower('".$schema."') AND table_name = lower('".$table."') AND constraint_name = '".$pkey."';";
+      $rn = spi_exec_query($select, 0);
+      $cols = $rn->{processed}; if ($cols > 0) { $primary = $rn->{rows}[0]->{column_name}; }
+   }
+   else { return; }
+   return $primary;
+$$ LANGUAGE 'plperl';
+
+<<pg51g_sql4_pkey_ord>>=
+CREATE OR REPLACE FUNCTION pg51g.sql4_pkey_ord(varchar,varchar) RETURNS TEXT AS $$
+   my $schema = shift; my $table = shift;
+   my $select = "SELECT table_schema, table_name, constraint_name, constraint_type FROM information_schema.table_constraints ";
+   $select .= "WHERE constraint_type = 'PRIMARY KEY' AND table_schema = '".$schema."' AND table_name = '".$table."';";
+   $rv = spi_exec_query($select, 0);
+   $rows = $rv->{processed}; my $output; my $pkey; my $primary;
+   if($rows > 0) {
+      $pkey = $rv->{rows}[0]->{constraint_name}; # this is the name of the index, not the column
+      $select = "SELECT ordinal_position, constraint_name, column_name, table_name, table_schema FROM information_schema.key_column_usage ";
+      $select .= "WHERE table_schema = lower('".$schema."') AND table_name = lower('".$table."') AND constraint_name = '".$pkey."';";
+      $rn = spi_exec_query($select, 0);
+      $cols = $rn->{processed}; if ($cols > 0) { $primary = $rn->{rows}[0]->{ordinal_position}; }
+   }
+   else { return; }
+   return $primary;
+$$ LANGUAGE 'plperl';
+
+<<pg51g_perl_process_table>>=
+CREATE OR REPLACE FUNCTION pg51g.perl_process_table(varchar,varchar) RETURNS TEXT AS $$
+   my $schema = shift; my $table = shift; my $select; my $rv;
+   $select = "SELECT pg51g.sql4_pkey2text('".$schema."','".$table."') AS result;";
+   $rv = spi_exec_query($select, 0);
+   my $key = $rv->{rows}[0]->{result};
+   $select = "SELECT pg51g.sql4_fields2text('".$schema."','".$table."') AS result;";
+   $rv = spi_exec_query($select, 0);
+   my $val = $rv->{rows}[0]->{result};
+   $select = "CREATE TABLE pg51g.".$schema."_".$table." AS SELECT 0 AS level, $key AS pri, md5($key) AS key, md5($val) AS val FROM ".$schema.".".$table.";" ;
+   $rv = spi_exec_query($select, 0);
+   my $rows = $rv->{processed};
+   $select = "SELECT ceil(ln($rows)/ln(1024)) AS result;";
+   $rv = spi_exec_query($select, 0);
+   my $depth = $rv->{rows}[0]->{result};
+   my $i; my $k; my $count; my $mask;
+   for($i=1;$i<=$depth;$i++) {
+    $select = "SELECT to_hex((1024^($depth-$i)-1)::int) AS result;";
+    $rv = spi_exec_query($select, 0);
+    $mask = $rv->{rows}[0]->{result};
+    $select = "SELECT $i AS level, pg51g.group_md5('".$mask."',key) AS mypri, pg51g.group_md5('".$mask."',key) AS mykey, pg51g.xor_md5(val) AS myval FROM pg51g.".$schema."_".$table." ";
+    #$select = "SELECT $i AS level, pg51g.group_md5('".$mask."',key) AS mypri, pg51g.xor_md5(key) AS mykey, pg51g.xor_md5(val) AS myval FROM pg51g.".$schema."_".$table." ";
+    $select .= "WHERE level = ".($i-1)." GROUP BY pg51g.group_md5('".$mask."',key);";
+    $rv = spi_exec_query($select, 0); $out = $select;
+    $count = $rv->{processed};
+    for($k=0;$k<$count;$k++) { $select = "INSERT INTO pg51g.".$schema."_".$table." VALUES ($i, '".$rv->{rows}[$k]->{mypri}."', '".$rv->{rows}[$k]->{mykey}."', '".$rv->{rows}[$k]->{myval}."');" ; spi_exec_query($select, 0); }
+    $select = "CREATE INDEX pg51g_".$schema."_".$table."_level_".$i." ON pg51g.".$schema."_".$table." USING btree( pg51g.group_md5('$mask',key) );";
+    $rv = spi_exec_query($select, 0);
+   }
+   $select = "CREATE INDEX pg51g_".$schema."_".$table."_level_pri ON pg51g.".$schema."_".$table." USING btree( level, pri );";
+   $rv = spi_exec_query($select, 0);
+   return $depth;
+$$ LANGUAGE 'plperl';
+
+@
