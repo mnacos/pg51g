@@ -609,7 +609,7 @@ static char * get_sig_schema(char *schname, char *tblname)
 static char * get_mask(int depth, int level)
 {
     if( level > depth ) { char *mask = (char *) palloc (2); sprintf(mask, "%d", 0); return mask; }
-    text *myhex = DatumGetTextPCopy( DirectFunctionCall1(to_hex32, Int32GetDatum( pow(1024, depth-level)-1 )));
+    text *myhex = DatumGetTextPCopy( DirectFunctionCall1(to_hex32, Int32GetDatum( pow(128, depth-level)-1 )));
     unsigned int myhexlen = VARSIZE(myhex) - VARHDRSZ;
     char *mask = (char *) palloc(myhexlen+1); strncpy(mask, &VARDATA(myhex)[0], myhexlen); mask[myhexlen] = '\0';
     return mask;
@@ -655,7 +655,7 @@ static char * get_group(char *mask, char *value)
    return chars;
 }
 
-static int get_depth(int rows) { return ceil(log(rows)/log(1024)); }
+static int get_depth(int rows) { return ceil(log(rows)/log(128)); }
 
 static int read_depth (char * target)
 {
@@ -721,14 +721,15 @@ static inline int higher_levels_for(char *sigtbl, char *target, int depth, char 
   and general lookup functions for the set reconciliation process (folding levels etc.)
 */
 
-static char * process_table (char * t_schema, char * t_table, char * pkey, char * val, int depth, char * sigtbl, bool perm)
+static char * process_table (char * t_schema, char * t_table, char * pkey, char * val, int depth, char * sigtbl, bool perm, char * restriction)
 {
     // we have the name of the target table, plus the name of the signature table to be created
-    char *string1 = "CREATE %s TABLE %s AS SELECT 0 AS level, %s AS pri, md5(%s) AS key, md5(%s) AS val FROM %s.%s;";
+    char *string1="CREATE %s TABLE %s AS SELECT 0 AS level,%s AS pri,md5(%s)::char(32) AS key,md5(%s)::char(32) AS val,pg51g.group_md5('%s',md5(%s))::char(32) AS grp FROM %s.%s %s;";
     char *sql, *mytemp; if (!perm) { mytemp = palloc(10); strcpy(mytemp, "TEMPORARY"); } else { mytemp = palloc(1); strcpy(mytemp, ""); }
-    int sql_s = strlen(string1)+strlen(mytemp)+strlen(t_schema)+strlen(t_table)+strlen(pkey)+strlen(pkey)+strlen(val)+strlen(sigtbl)-8;
+        char *mask; mask = get_mask(depth, 1);
+    int sql_s = strlen(string1)+strlen(mytemp)+strlen(t_schema)+strlen(t_table)+3*strlen(pkey)+strlen(val)+strlen(mask)+strlen(sigtbl)+strlen(restriction)-12;
     sql = palloc(sql_s + 1); memset(sql, 0, sql_s + 1);
-    sprintf(sql, string1, mytemp, sigtbl, pkey, pkey, val, t_schema, t_table); int ret;
+    sprintf(sql, string1, mytemp, sigtbl, pkey, pkey, val, mask, pkey, t_schema, t_table, restriction); int ret;
 
     if ((ret = SPI_connect()) < 0) { ereport(ERROR,
                                                    ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
@@ -746,27 +747,17 @@ static char * process_table (char * t_schema, char * t_table, char * pkey, char 
     }
     int rows = SPI_processed; // int depth = get_depth(rows);
 
-    char *string2 = "SELECT %d AS level, pg51g.group_md5('%s', key) AS mypri, pg51g.group_md5('%s', key) AS mykey, pg51g.xor_md5(val) AS myval FROM %s WHERE level = %d GROUP BY pg51g.group_md5('%s', key);";
-    char *string3 = "INSERT INTO ";
-    char *string4 = " VALUES (%s, '%s', '%s', '%s');";
-    char *tblname = get_table(sigtbl);
-    char *string5 = "CREATE INDEX pg51g_%s_level_%d ON %s USING btree( pg51g.group_md5('%s', key) );";
-    char *string6 = "CREATE INDEX pg51g_%s_level_pri ON %s USING btree( level, pri );";
-    char *string7 = "CREATE INDEX pg51g_%s_level_%d_mask ON %s USING btree( level, pg51g.group_md5('%s', key) ) WHERE level = %d;";
+    char *hinsert = "INSERT INTO %s SELECT %d AS level, grp, grp, pg51g.xor_md5(val) AS myval, pg51g.group_md5('%s', grp) FROM %s WHERE level = %d GROUP BY grp;";
+    int q_s = strlen(hinsert) + 2*strlen(sigtbl) + 99;
 
-    int q_s = strlen(string2) + strlen(sigtbl) + 99;
-    int i, ins_s; char *mask, *q, *ins, *tmp, *idx;
+    char *tblname = get_table(sigtbl);
+    int i; char *q, *tmp, *idx;
 
     char *res = (char *) palloc(8192); strcpy(res,"");
     for(i=1; i<=depth; i++) {
-        mask = get_mask(depth, i);
+        mask = get_mask(depth, i+1);
         q = palloc(q_s + 1);
-        sprintf(q, string2, i, mask, mask, sigtbl, i-1, mask);
-
-        ins_s = strlen(string3) + strlen(string4) + strlen(sigtbl);
-        ins = palloc(ins_s + 1);
-        strcpy(ins, string3); strcat(ins, sigtbl); strcat(ins, string4);
-
+        sprintf(q, hinsert, sigtbl, i, mask, sigtbl, i-1);
         ret = SPI_exec(q,0);
         if (ret < 0) { ereport(ERROR,
                                       ( errcode(ERRCODE_SUCCESSFUL_COMPLETION),
@@ -774,34 +765,21 @@ static char * process_table (char * t_schema, char * t_table, char * pkey, char 
                                         errhint("Please be careful about the SQL you throw at pg51g_self_fold!")  )
                               );
         }
-
-        int count = SPI_processed; int k;
-        if (SPI_tuptable != NULL && count > 0) {
-            TupleDesc tupdesc = SPI_tuptable->tupdesc;
-            SPITupleTable *tuptable = SPI_tuptable;
-            for(k=0; k<count; k++) {
-                HeapTuple tuple = tuptable->vals[k]; // we only need the first field of the first tuple
-                if (!(tuple == 0)) {
-                    char *one = SPI_getvalue(tuple, tupdesc, 1);
-                    char *two = SPI_getvalue(tuple, tupdesc, 2);
-                    char *three = SPI_getvalue(tuple, tupdesc, 3);
-                    char *four = SPI_getvalue(tuple, tupdesc, 4);
-                    char *five = palloc( strlen(ins) + strlen(one) + strlen(two) + strlen(three) + strlen(four) );
-                    sprintf(five, ins, one, two, three, four);
-                    SPI_push(); char *tmp = return_val(five); strcpy(res, tmp); SPI_pop();
-                }
-            }
-            char *six = palloc( strlen(string5) + strlen(tblname) + strlen(sigtbl) + strlen(mask) + 2 );
-            sprintf(six, string5, tblname, i, sigtbl, mask);
-            SPI_push(); char *hello = return_val(six); SPI_pop();
-            char *eight = palloc( strlen(string7) + strlen(tblname) + strlen(sigtbl) + strlen(mask) + 4 );
-            sprintf(eight, string7, tblname, i, sigtbl, mask, i-1);
-            SPI_push(); char *any = return_val(eight); SPI_pop();
-        }
     }
-    char *seven = palloc( strlen(string6) + strlen(tblname) + strlen(sigtbl) + 2 );
-    sprintf(seven, string6, tblname, sigtbl);
-    SPI_push(); char *bye = return_val(seven); SPI_pop();
+
+        // generating indexes
+
+    char *grpidx_t = "CREATE INDEX pg51g_%s_level_grp ON %s USING btree( level, grp );";
+    char *priidx_t = "CREATE INDEX pg51g_%s_level_pri ON %s USING btree( level, pri );";
+
+    char *grpidx = palloc( strlen(grpidx_t) + strlen(tblname) + strlen(sigtbl) - 3 );
+    char *priidx = palloc( strlen(priidx_t) + strlen(tblname) + strlen(sigtbl) - 3 );
+
+    sprintf(grpidx, grpidx_t, tblname, sigtbl);
+    sprintf(priidx, priidx_t, tblname, sigtbl);
+
+    SPI_push(); char *idx1 = return_val(grpidx); SPI_pop();
+    SPI_push(); char *idx2 = return_val(priidx); SPI_pop();
 
     SPI_finish();
     return res;
@@ -1452,8 +1430,10 @@ Datum add_table(PG_FUNCTION_ARGS)
 
     char *sigtbl = get_sig_target(schname, tblname);
 
+        char *restrict = (char *) palloc(1); restrict[0] = '\0';
+
     // generating the signature table -- false as last argument will create TEMPORARY signature table
-    res = process_table(schname, tblname, pkey, val, depth, sigtbl, true);
+    res = process_table(schname, tblname, pkey, val, depth, sigtbl, true, restrict);
 
     // registering the new signature table in the metadata table
     char *reg = reg_table(schname, tblname, pkey, val, depth, !table_is_temp(tblname), table_is_view(schname, tblname));
@@ -1477,6 +1457,49 @@ Datum add_table(PG_FUNCTION_ARGS)
     VarChar *new_varchar = (VarChar *) palloc(new_size);
     SET_VARSIZE(new_varchar, new_size);
     memcpy(VARDATA(new_varchar), sigtbl, res_s); pfree(buf);
+    PG_RETURN_VARCHAR_P(new_varchar);
+}
+
+PG_FUNCTION_INFO_V1(temp_sigtbl);
+Datum temp_sigtbl(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) { PG_RETURN_NULL(); } 
+    if (PG_ARGISNULL(1)) { PG_RETURN_NULL(); } 
+    if (PG_ARGISNULL(2)) { PG_RETURN_NULL(); } 
+    if (PG_ARGISNULL(3)) { PG_RETURN_NULL(); } 
+
+    VarChar *sql = PG_GETARG_VARCHAR_P(0); unsigned int size = VARSIZE(sql) - VARHDRSZ;
+    char *buf = (char *) palloc(size+1); int ret; char *res = (char *) palloc(8192);
+    strncpy(buf,VARDATA(sql),size); buf[size] = '\0'; // converting varchar into native string
+
+    VarChar *mytarget = PG_GETARG_VARCHAR_P(1); unsigned int mysize = VARSIZE(mytarget) - VARHDRSZ;
+    char *mytmp = (char *) palloc(mysize+1); strncpy(mytmp,VARDATA(mytarget),mysize); mytmp[mysize] = '\0';
+
+    VarChar *myrestrict = PG_GETARG_VARCHAR_P(2); unsigned int mysizeplus = VARSIZE(myrestrict) - VARHDRSZ;
+    char *restrict = (char *) palloc(mysizeplus+1); strncpy(restrict,VARDATA(myrestrict),mysizeplus); restrict[mysizeplus] = '\0';
+
+        int depth = PG_GETARG_INT32(3);
+
+    char *schname = get_schema(buf);
+    char *tblname = get_table(buf);
+
+    char *pkey = pkey_text(schname, tblname);
+    char *val = val_text(schname, tblname);
+
+    // if the table doesn't exist, has no primary key or no pkey,val, return null
+    if( !( strlen(pkey) > 0 && strlen(val) > 0 )  ) {
+        elog(ERROR, "[pg51g] temp_sigtbl('%s'): does this table have a primary key?", buf);
+        PG_RETURN_NULL();
+    }
+
+    // generating the signature table -- false as last argument will create TEMPORARY signature table
+    res = process_table(schname, tblname, pkey, val, depth, mytmp, false, restrict);
+
+    int res_s = strlen(mytmp);
+    int32 new_size = res_s + VARHDRSZ;
+    VarChar *new_varchar = (VarChar *) palloc(new_size);
+    SET_VARSIZE(new_varchar, new_size);
+    memcpy(VARDATA(new_varchar), mytmp, res_s); pfree(buf);
     PG_RETURN_VARCHAR_P(new_varchar);
 }
 
@@ -1901,8 +1924,9 @@ static char * sync_saved (char * schname, char * tblname)
     }
 
         del_dlist(pris); pfree(buf); pfree(current_tbl); pfree(saved_tbl); pfree(mask);
-
-        return "sync_saved";
+    char *res; res = palloc(128 * sizeof(char));
+    sprintf(res, "%d", tempsize);
+    return res;
 }
 
 static char * sync_saved_and_do (char * schname, char * tblname, int (*proc)(char *, char *, char *, char *, int))
@@ -2015,6 +2039,7 @@ Datum do_table(PG_FUNCTION_ARGS)
     char *sigtbl = get_sig_target(schname, tblname);
 
     bool perm = read_persists(schname, tblname); char *res; res = sigtbl;
+        char *restrict = (char *) palloc(1); restrict[0] = '\0';
 
     if( read_is_view(schname, tblname) ) {
         // recreating the TEMP view if it's not there
@@ -2025,12 +2050,12 @@ Datum do_table(PG_FUNCTION_ARGS)
         }
         // replacing an existing sigtbl with a fresh one
         drop_if_exists( get_schema(sigtbl), get_table(sigtbl) ); // getting rid of the table, if it's already there
-        process_table (schname, tblname, key, val, depth, sigtbl, true);
+        process_table (schname, tblname, key, val, depth, sigtbl, true, restrict);
     }
     else {
         if (!perm) { 
             drop_if_exists( get_schema(sigtbl), get_table(sigtbl) ); // getting rid of the table, if it's already there
-            process_table (schname, tblname, key, val, depth, sigtbl, true);
+            process_table (schname, tblname, key, val, depth, sigtbl, true, restrict);
         }
     }
 
@@ -2068,7 +2093,7 @@ Datum snap_table(PG_FUNCTION_ARGS)
     int32 new_size = res_s + VARHDRSZ;
     VarChar *new_varchar = (VarChar *) palloc(new_size);
     SET_VARSIZE(new_varchar, new_size);
-    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf);
+    memcpy(VARDATA(new_varchar), res, res_s); pfree(buf); pfree(res);
     PG_RETURN_VARCHAR_P(new_varchar);
 }
 

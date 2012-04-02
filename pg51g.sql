@@ -20,12 +20,14 @@ CREATE OR REPLACE FUNCTION pg51g.dummy() RETURNS trigger AS 'pg51g.so', 'dummy_t
 
 CREATE OR REPLACE FUNCTION pg51g.freeze() RETURNS trigger AS 'pg51g.so', 'freeze_trigger' LANGUAGE 'C';
 
+
 CREATE OR REPLACE FUNCTION pg51g.add(varchar) RETURNS VARCHAR AS 'pg51g.so', 'add_table' LANGUAGE 'C';
+
+CREATE OR REPLACE FUNCTION pg51g.tmp(VARCHAR, VARCHAR, VARCHAR, INT) RETURNS VARCHAR AS 'pg51g.so', 'temp_sigtbl' LANGUAGE 'C';
 
 CREATE OR REPLACE FUNCTION pg51g.del(varchar) RETURNS VARCHAR AS 'pg51g.so', 'rm_table' LANGUAGE 'C';
 
 CREATE OR REPLACE FUNCTION pg51g.diff(IN VARCHAR, OUT key VARCHAR, OUT op VARCHAR) RETURNS SETOF RECORD AS 'pg51g.so', 'diff_table' LANGUAGE 'C';
-
 CREATE OR REPLACE FUNCTION pg51g.push(varchar) RETURNS VARCHAR AS 'pg51g.so', 'diff_push' LANGUAGE 'C';
 
 CREATE OR REPLACE FUNCTION pg51g.do(varchar) RETURNS VARCHAR AS 'pg51g.so', 'do_table' LANGUAGE 'C';
@@ -47,6 +49,12 @@ CREATE OR REPLACE FUNCTION pg51g.val(varchar, varchar) RETURNS VARCHAR AS 'pg51g
 CREATE OR REPLACE FUNCTION pg51g.unkey(varchar) RETURNS VARCHAR AS 'pg51g.so', 'undef_pkey' LANGUAGE 'C';
 
 CREATE OR REPLACE FUNCTION pg51g.unval(varchar) RETURNS VARCHAR AS 'pg51g.so', 'undef_val' LANGUAGE 'C';
+
+-- This function is called by external clients
+
+CREATE OR REPLACE FUNCTION pg51g.mask4level(int,int) RETURNS TEXT AS $$
+   SELECT to_hex((1024^($1-$2)-1)::int) AS result;
+$$ LANGUAGE 'sql';
 
 CREATE TABLE pg51g.metadata (
    id SERIAL NOT NULL, 
@@ -286,12 +294,6 @@ $$
     END;
 $$ LANGUAGE 'plpgsql';
 
--- The only reason this function is here is because it is called by our sample Java code
-
-CREATE OR REPLACE FUNCTION pg51g.mask4level(int,int) RETURNS TEXT AS $$
-   SELECT to_hex((1024^($1-$2)-1)::int) AS result;
-$$ LANGUAGE 'sql';
-
 -- Essential for defer() / sync() functionality
 
 CREATE OR REPLACE FUNCTION pg51g.higher_levels(my_schema TEXT, my_table TEXT) RETURNS TEXT AS $$
@@ -396,6 +398,5 @@ $$
          RETURN;
     END;
 $$ LANGUAGE 'plpgsql';
-
 
 
