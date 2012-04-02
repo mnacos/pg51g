@@ -1,1 +1,6 @@
 Please read pg51g.nw instead.
+
+diff_http.erl requires the epg executable installed in your path
+and mochiweb installed in your erlang libs.
+
+You may then run diff_http:start(8080). in the erlang shell.
